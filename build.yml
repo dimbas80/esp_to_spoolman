@@ -1,0 +1,159 @@
+name: 🏭 Сборка прошивки ESPHome
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'device.yaml'      # Запуск ТОЛЬКО при изменении device.yaml
+  workflow_dispatch:       # И ручной запуск
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Загружаем код
+      - name: 📥 Получаем репозиторий
+        uses: actions/checkout@v4
+      
+      # 2. Проверяем, что device.yaml существует
+      - name: 🔍 Проверка конфига
+        run: |
+          if [ ! -f "device.yaml" ]; then
+            echo "❌ Ошибка: файл device.yaml не найден!"
+            echo "Создайте device.yaml с конфигурацией ESPHome"
+            exit 1
+          fi
+          echo "✅ device.yaml найден"
+      
+      # 3. Устанавливаем Python
+      - name: 🐍 Устанавливаем Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      # 4. Ставим ESPHome
+      - name: 📦 Устанавливаем ESPHome
+        run: pip install esphome
+      
+      # 5. Секреты (опционально)
+      - name: 🔐 Настраиваем секреты
+        run: |
+          if grep -q "!secret" "device.yaml"; then
+            echo "🔐 Создаю файл secrets.yaml"
+            cat > secrets.yaml << 'EOF'
+          wifi_ssid: "${{ secrets.WIFI_SSID }}"
+          wifi_password: "${{ secrets.WIFI_PASSWORD }}"
+          api_encryption_key: "${{ secrets.API_ENCRYPTION_KEY }}"
+          ota_password: "${{ secrets.OTA_PASSWORD }}"
+          EOF
+            echo "✅ Секреты настроены"
+          else
+            echo "ℹ️ Секреты не требуются"
+          fi
+      
+      # 6. Компилируем
+      - name: 🛠️ Компилируем прошивку
+        run: esphome compile device.yaml
+      
+      # 7. Получаем имя устройства
+      - name: 🏷️ Определяем имя устройства
+        id: get_device
+        run: |
+          # Извлекаем имя устройства из device.yaml
+          NAME=$(grep -m1 "^  name:" device.yaml || grep -m1 "^name:" device.yaml)
+          DEVICE_NAME=$(echo "$NAME" | awk -F: '{print $2}' | tr -d ' "')
+          
+          if [ -z "$DEVICE_NAME" ]; then
+            echo "⚠️ Не могу определить имя устройства, использую 'device'"
+            DEVICE_NAME="device"
+          fi
+          
+          echo "Имя устройства: $DEVICE_NAME"
+          echo "device_name=$DEVICE_NAME" >> $GITHUB_OUTPUT
+      
+      # 8. Копируем файлы с понятными именами
+      - name: 📂 Готовим файлы для скачивания
+        run: |
+          DEVICE_NAME="${{ steps.get_device.outputs.device_name }}"
+          
+          echo "📁 Копирую файлы прошивки:"
+          
+          # firmware.bin → firmware.bin
+          cp ".esphome/build/$DEVICE_NAME/.pioenvs/$DEVICE_NAME/firmware.bin" "./firmware.bin"
+          echo "✅ firmware.bin готов"
+          
+          # firmware.factory.bin → factory.bin
+          cp ".esphome/build/$DEVICE_NAME/.pioenvs/$DEVICE_NAME/firmware.factory.bin" "./factory.bin"
+          echo "✅ factory.bin готов"
+          
+          # Показываем размеры
+          echo ""
+          echo "📊 Размеры файлов:"
+          ls -lh *.bin
+      
+      # 9. Создаём README файл
+      - name: 📝 Создаём README
+        run: |
+          DEVICE_NAME="${{ steps.get_device.outputs.device_name }}"
+          
+          cat > README.txt << EOF
+          =========================================
+          ПРОШИВКА ESPHome
+          =========================================
+          
+          📋 ИНФОРМАЦИЯ О СБОРКЕ:
+          
+          Устройство: $DEVICE_NAME
+          Дата сборки: $(date "+%Y-%m-%d %H:%M:%S")
+          Версия ESPHome: $(esphome version | head -1)
+          
+          =========================================
+          📁 ФАЙЛЫ В АРХИВЕ:
+          
+          1. firmware.bin
+             Назначение: OTA-обновление (по Wi-Fi)
+             Как использовать:
+               • Устройство должно быть подключено к Wi-Fi
+               • Откройте веб-интерфейс (http://IP-адрес-устройства)
+               • Перейдите в раздел "Обновление"
+               • Загрузите этот файл
+          
+          2. factory.bin
+             Назначение: Первичная прошивка (через USB)
+             Как использовать:
+               • Подключите ESP к компьютеру через USB-UART адаптер
+               • Используйте esptool.py или Flash Download Tool
+               • Загрузите файл по адресу 0x0
+          
+          =========================================
+          ⚙️ КОНФИГУРАЦИЯ УСТРОЙСТВА:
+          
+          Платформа: $(grep -m1 "platform:" device.yaml || echo "Не указана")
+          Плата: $(grep -m1 "board:" device.yaml | sed 's/.*://' | tr -d ' "')
+          
+          =========================================
+          ❓ ПОМОЩЬ:
+          
+          • Ошибка при прошивке: проверьте подключение и выбранный порт
+          • Устройство не подключается к Wi-Fi: проверьте настройки в device.yaml
+          • Нужна новая прошивка: измените device.yaml и запустите сборку заново
+          
+          =========================================
+          EOF
+          
+          echo "✅ README.txt создан"
+          echo ""
+          echo "📄 Содержимое README:"
+          cat README.txt
+      
+      # 10. Загружаем в Artifacts
+      - name: 📤 Загружаем прошивку с документацией
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-package
+          path: |
+            firmware.bin
+            factory.bin
+            README.txt
+          retention-days: 7
