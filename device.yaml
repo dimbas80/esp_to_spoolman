@@ -1,0 +1,382 @@
+esphome:
+  name: nfc-spool-activator
+  friendly_name: NFC Spool Activator
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# ────────────────────────────────────────────────
+# Networking / Core Components
+# ────────────────────────────────────────────────
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+logger:
+
+ota:
+  platform: esphome
+
+http_request:
+  verify_ssl: false
+
+# ────────────────────────────────────────────────
+# I²C bus (shared between PN532 & SSD1306 OLED)
+# ────────────────────────────────────────────────
+i2c:
+  sda: GPIO5
+  scl: GPIO6
+  scan: true
+
+# ────────────────────────────────────────────────
+# PN532 NFC Reader
+# ────────────────────────────────────────────────
+pn532_i2c:
+  id: my_pn532
+  on_tag:
+    then:
+      - binary_sensor.template.publish:
+          id: nfc_tag_detected
+          state: true
+      - lambda: |-
+          std::string uid_hex = "";
+          for (auto byte : x) {
+            char buf[3];
+            sprintf(buf, "%02X", byte);
+            uid_hex += buf;
+          }
+          std::string current_uid = uid_hex;
+          std::string last_uid = id(last_uid_sensor).state;
+          bool tag_changed = (current_uid != last_uid);
+
+          if (tag_changed) {
+            std::string sm_id_str = "";
+            std::string color_hex_str = "";
+            std::string type_str = "";
+            std::string min_temp_str = "";
+            std::string max_temp_str = "";
+            std::string brand_str = "";
+
+            if (tag.has_ndef_message()) {
+              auto message = tag.get_ndef_message();
+              auto records = message->get_records();
+              for (auto &record : records) {
+                std::string payload = record->get_payload();
+
+                auto extract = [&](const std::string &key, std::string &target) {
+                  size_t start = payload.find("\"" + key + "\":\"");
+                  if (start != std::string::npos) {
+                    start += key.size() + 4;
+                    size_t end = payload.find("\"", start);
+                    if (end != std::string::npos) {
+                      target = payload.substr(start, end - start);
+                    }
+                  }
+                };
+                extract("sm_id", sm_id_str);
+                extract("color_hex", color_hex_str);
+                extract("type", type_str);
+                extract("min_temp", min_temp_str);
+                extract("max_temp", max_temp_str);
+                extract("brand", brand_str);
+              }
+            }
+
+            if (!sm_id_str.empty()) {
+              id(sm_id_sensor).publish_state(sm_id_str);
+              id(color_hex_sensor).publish_state(color_hex_str);
+              id(type_sensor).publish_state(type_str);
+              id(min_temp_sensor).publish_state(min_temp_str);
+              id(max_temp_sensor).publish_state(max_temp_str);
+              id(brand_sensor).publish_state(brand_str);
+              id(last_uid_sensor).publish_state(current_uid);
+
+              // Immediately request spool data from Spoolman
+              id(spoolman_request_timer).execute();
+            } else {
+              id(sm_id_sensor).publish_state("unknown");
+              id(color_hex_sensor).publish_state("unknown");
+              id(type_sensor).publish_state("unknown");
+              id(min_temp_sensor).publish_state("unknown");
+              id(max_temp_sensor).publish_state("unknown");
+              id(brand_sensor).publish_state("unknown");
+              id(last_uid_sensor).publish_state(current_uid);
+            }
+          }
+  on_tag_removed:
+    then:
+      - binary_sensor.template.publish:
+          id: nfc_tag_detected
+          state: false
+
+# ────────────────────────────────────────────────
+# Spool Data Sensors
+# ────────────────────────────────────────────────
+text_sensor:
+  - platform: template
+    name: "Spool ID (sm_id)"
+    id: sm_id_sensor
+    update_interval: 1s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(sm_id_sensor).state.empty() && id(sm_id_sensor).state != "unknown";'
+            then:
+              - http_request.post:
+                  url: http://klipper.local:7125/server/spoolman/spool_id
+                  request_headers:
+                    Content-Type: application/json
+                  json:
+                    spool_id: !lambda "return id(sm_id_sensor).state;"
+        - if:
+            condition: 
+              lambda: 'return id(sm_id_sensor).state == "unknown";'
+            then:
+			  #this baically ejects the current spool.
+              - http_request.post:
+                  url: http://klipper.local:7125/server/spoolman/spool_id
+                  request_headers:
+                    Content-Type: application/json
+                  body: "{}"
+
+  - platform: template
+    name: "Spool Color Hex"
+    id: color_hex_sensor
+  - platform: template
+    name: "Spool Type"
+    id: type_sensor
+  - platform: template
+    name: "Spool Min Temp"
+    id: min_temp_sensor
+  - platform: template
+    name: "Spool Max Temp"
+    id: max_temp_sensor
+  - platform: template
+    name: "Spool Brand"
+    id: brand_sensor
+  - platform: template
+    name: "Last Tag UID"
+    id: last_uid_sensor
+
+sensor:
+  - platform: template
+    name: "Spool Weight"
+    id: spool_weight
+    unit_of_measurement: "g"
+    accuracy_decimals: 1
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_sensor
+    update_interval: 10s
+
+binary_sensor:
+  - platform: status
+    name: "ESPHome API Connected"
+    id: api_connected
+  - platform: template
+    name: "NFC Tag Detected"
+    id: nfc_tag_detected
+    # Initialize as false (no tag detected)
+    lambda: 'return false;'
+  
+# ────────────────────────────────────────────────
+# HTTP Polling for Spool Weight
+# ────────────────────────────────────────────────
+interval:
+  - interval: 10s
+    then:
+      - script.execute: spoolman_request_timer
+
+script:
+  - id: spoolman_request_timer
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(sm_id_sensor).state.empty() && id(sm_id_sensor).state != "unknown";'
+          then:
+            - http_request.get:
+                capture_response: true
+                url: !lambda |-
+                  return "http://spoolman.local7912/api/v1/spool/" + id(sm_id_sensor).state;
+                on_response:
+                  then:
+                  - logger.log:
+                        format: 'Response status: %d, Content-Type: %s"\nBody: %s'
+                        args:
+                          - response->status_code
+                          - response->get_response_header("Content-Type").c_str()
+                          - body
+                  - lambda: |-
+                      json::parse_json(body, [](JsonObject root) -> bool {
+                          if (!root["remaining_weight"].isNull() && root["remaining_weight"].is<float>()) {
+                              id(spool_weight).publish_state(root["remaining_weight"].as<float>());
+                              return true;
+                          } else {
+                              ESP_LOGD("info", "No valid 'remaining_weight' key in this JSON!");
+                              id(spool_weight).publish_state(NAN);
+                              return false;
+                          }
+                      });
+# ────────────────────────────────────────────────
+# Fonts (MDI + Text)
+# ────────────────────────────────────────────────
+font:
+  - file: "fonts/arial.ttf"
+    id: font_small
+    size: 10
+  - file: "fonts/arial_bold.ttf"
+    id: font_large
+    size: 18
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: font_mdi
+    size: 14
+    glyphs:
+      - "\U000F05A9"  # mdi-wifi
+      - "\U000F05AA"  # mdi-wifi-off
+      - "\U000F048D"  # mdi-server-network
+      - "\U000F048E"  # mdi-server-network-off
+      - "\U000F0E53"  # mdi-nfc-search-variant
+      - "\U000F0397"  # mdi-nfc-tap
+      - "\U000F0B3F"  #// 0: mdi:radiator-off
+      - "\U000F0261"  #// 1: mdi:fire (low)
+      - "\U000F0E5E"  #// 2: mdi:heat-wave (medium)
+      - "\U000F0E5D"  #// 3: mdi:fire-alert (high)
+
+
+# ────────────────────────────────────────────────
+# SSD1306 OLED Display Layout
+# ────────────────────────────────────────────────
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: oled_display
+    show_test_card: false
+    update_interval: 1s
+    lambda: |-
+      // --------------------------------------------------------------
+      // 1. Accurate hex to colour name (HSV + weighted RGB fallback)
+      // --------------------------------------------------------------
+      auto hex_to_color_name = [](const std::string& hex) -> std::string {
+        // ---- Normalise input -------------------------------------------------
+        std::string h = hex;
+        if (h.empty()) return "unknown";
+        if (h[0] == '#') h = h.substr(1);
+        if (h.size() != 6) return "invalid";
+        for (char& c : h) c = std::toupper(c);
+        uint32_t v = std::stoul(h, nullptr, 16);
+        int r = v >> 16, g = v >> 8 & 0xFF, b = v & 0xFF;
+
+        // ---- Helper: RGB to HSV (float) --------------------------------------
+        auto rgb_to_hsv = [](int r, int g, int b) {
+          float rf = r/255.f, gf = g/255.f, bf = b/255.f;
+          float M = std::max({rf,gf,bf}), m = std::min({rf,gf,bf});
+          float c = M - m;
+          float h = 0;
+          if (c > 0) {
+            if (M == rf) h = fmod((gf-bf)/c, 6.f);
+            else if (M == gf) h = (bf-rf)/c + 2.f;
+            else h = (rf-gf)/c + 4.f;
+            h *= 60.f;
+          }
+          float s = (M > 0) ? c/M : 0;
+          return std::make_tuple(h, s, M);
+        };
+
+        // ---- Colour table (HSV + name) ---------------------------------------
+        struct Col { float h,s,v; const char* name; };
+        static const Col cols[] = {
+          {  0, 1.0, 1.0, "Red"     },   // #FF0000
+          {120, 1.0, 1.0, "Green"   },   // #00FF00
+          {240, 1.0, 1.0, "Blue"    },   // #0000FF
+          { 60, 1.0, 1.0, "Yellow"  },   // #FFFF00
+          {300, 1.0, 1.0, "Magenta" },   // #FF00FF
+          {180, 1.0, 1.0, "Cyan"    },   // #00FFFF
+          {  0, 0.0, 1.0, "White"   },   // #FFFFFF
+          {  0, 0.0, 0.0, "Black"   },   // #000000
+          { 39, 1.0, 1.0, "Orange"  },   // #FFA500
+          {270, 1.0, 0.5, "Purple"  }    // #800080
+        };
+
+        // ---- Compute HSV of input --------------------------------------------
+        auto [hi, si, vi] = rgb_to_hsv(r,g,b);
+
+        // ---- Find best match (angular hue + saturation/value penalty) -------
+        float best = 1e9;
+        const char* best_name = "unknown";
+
+        for (const auto& c : cols) {
+          // Hue distance (circular, 0-360)
+          float dh = std::abs(hi - c.h);
+          if (dh > 180) dh = 360 - dh;
+          // Penalties for saturation/value mismatch
+          float ds = std::abs(si - c.s);
+          float dv = std::abs(vi - c.v);
+          // Weighted score – hue is most important
+          float score = dh*1.0f + ds*80.f + dv*80.f;
+          if (score < best) { best = score; best_name = c.name; }
+        }
+
+        // Accept only reasonably close matches
+        return (best < 180.f) ? best_name : "unknown";
+      };
+
+      // --------------------------------------------------------------
+      // 2. Top yellow bar + icons (unchanged)
+      // --------------------------------------------------------------
+      it.filled_rectangle(0, 0, 128, 16, COLOR_ON);
+
+      if (id(nfc_tag_detected).state) {
+        it.print(83, 1, id(font_mdi), COLOR_OFF, "\U000F0397");
+      } else {
+        it.print(83, 1, id(font_mdi), COLOR_OFF, "\U000F0E53");
+      }
+      if (id(api_connected).state) {
+        it.print(98, 1, id(font_mdi), COLOR_OFF, "\U000F048D");
+      } else {
+        it.print(98, 1, id(font_mdi), COLOR_OFF, "\U000F048E");
+      }
+      if (id(wifi_signal_sensor).state > -70) {
+        it.print(113, 1, id(font_mdi), COLOR_OFF, "\U000F05A9");
+      } else {
+        it.print(113, 1, id(font_mdi), COLOR_OFF, "\U000F05AA");
+      }
+
+      // --------------------------------------------------------------
+      // 3. NEW LINES – immediately under the status bar
+      // --------------------------------------------------------------
+      // 3a – Filament type (large font)
+      std::string filament_type = id(type_sensor).state.c_str();
+      if (filament_type.empty() || filament_type == "unknown")
+        filament_type = "No Tag";
+      it.printf(2, 15, id(font_large), COLOR_ON, "%s", filament_type.c_str());
+
+      // 3b – Colour name (accurate HSV version)
+      std::string color_name = "unknown";
+      if (id(color_hex_sensor).has_state())
+        color_name = hex_to_color_name(id(color_hex_sensor).state);
+      it.printf(2, 31, id(font_small), COLOR_ON, "Color: %s", color_name.c_str());
+
+      // 3c – Brand
+      std::string brand = id(brand_sensor).has_state()
+                          ? id(brand_sensor).state.c_str()
+                          : "-";
+      it.printf(2, 41, id(font_small), COLOR_ON, "Brand: %s", brand.c_str());
+
+      // --------------------------------------------------------------
+      // 4. Weight line – **exactly original position**
+      // --------------------------------------------------------------
+      char weight_str[24];
+      if (filament_type.empty() || filament_type == "unknown")
+        sprintf(weight_str, "No weight!");
+      else
+        sprintf(weight_str, "Weight: %4.0fg", id(spool_weight).state);
+      it.print(2, 3, id(font_small), COLOR_OFF, weight_str);
+
+      // Placeholder at bottom
+      it.print(2, 54, id(font_small), COLOR_ON, TextAlign::LEFT, "Placeholder");
