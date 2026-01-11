@@ -1,5 +1,5 @@
 # ESP_TO_SPOOLMAN
-Данный проект реализует считывание NFC меток типа NTAG2xx установленных на катушках с филаментом, и установку активной катушки в сервис [Spoolman]([https://github.com/ManuelW77/Filaman](https://github.com/Donkie/Spoolman#integration-status))  через Moonraker.
+Данный проект реализует считывание NFC меток типа NTAG2xx установленных на катушках с филаментом, и установку активной катушки в сервис [Spoolman]([https://github.com/ManuelW77/Filaman](https://github.com/Donkie/Spoolman#integration-status))  через Moonraker. Spoolman должен быть установлен и настроен в вашей сети и принтере.
 ## Используемые компоненты
 1. Контроллер ESP32-C3 super mini
 2. Считыватель NFC меток RFID-RC522
@@ -15,7 +15,7 @@
 Метки можно применять такие NTAG215 
 <img width="480" height="640" alt="shem" src="img/ntag215.webp" />
 
-# СХЕМА
+## СХЕМА
 Схема подключения модуля и ESP32
 
 <img width="3000" height="1998" alt="shem" src="shems/shem.png" />
@@ -30,7 +30,10 @@
 <img width="317" height="856" alt="shem" src="img/web.jpg" />
 
 ## Вид web-интерфейса принтера с установленной катушкой
-<img width="414" height="182" alt="shem" src="img/spoolman.jpgg" />
+<img width="414" height="182" alt="shem" src="img/spoolman.jpg" />
+
+## Общий вид устройства
+Файлы для печати доступны 
 
 
 
