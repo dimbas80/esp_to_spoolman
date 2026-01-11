@@ -1,5 +1,5 @@
 # ESP_TO_SPOOLMAN
-Данный проект реализует считывание NFC меток типа NTAG2xx установленных на катушках с филаментом, и установку активной катушки в сервис Spoolman через Moonraker.
+Данный проект реализует считывание NFC меток типа NTAG2xx установленных на катушках с филаментом, и установку активной катушки в сервис [Spoolman]([https://github.com/ManuelW77/Filaman](https://github.com/Donkie/Spoolman#integration-status))  через Moonraker.
 ## Используемые компоненты
 1. Контроллер ESP32-C3 super mini
 2. Считыватель NFC меток RFID-RC522
@@ -12,7 +12,8 @@
 
 ## Запись меток
 Запись меток осуществляется с помощью проекта [FilaMan](https://github.com/ManuelW77/Filaman)
-Метки можно применять такие NTAG215 <img width="3000" height="1998" alt="shem" src="img/ntag215.webp" />
+Метки можно применять такие NTAG215 
+<img width="480" height="640" alt="shem" src="img/ntag215.webp" />
 
 # СХЕМА
 Схема подключения модуля и ESP32
@@ -20,4 +21,16 @@
 <img width="3000" height="1998" alt="shem" src="shems/shem.png" />
 
 ## Pinout ESP32-C3 super mini
-<img width="3000" height="1998" alt="shem" src="shems/esp32-c3 super mini pinout.png" />
+<img width="1280" height="860" alt="shem" src="shems/esp32-c3 super mini pinout.png" />
+
+## Работа устройства
+При включении ESP создает точку доступа с именем "ESP to Spoolman" и будет мигать синий светодиод к которой необходимо подключиться и перейти по IP 192.168.4.1. В  настройках необходимо ввести данные свой wifi сети, IP адрес сервера Spoolman, и IP адрес сервера Moonraker (ваш принтер с Klipper). И нажать кнопку "Save&Restart". После переподключения должны гореть зеленые светодиоды о доступности серверов и считывателя NFC. При необходимости нажать кнопку "Проверка статуса серверов". Светодиод на устройстве должен гороть зеленым. При поднисении метки к считывателю и успешном считывании метки светодиод мигнет желтым и установиться текущая катушка в web-интерфейсе вашего принтера
+
+## Вид web-интерфейса устройства
+<img width="317" height="856" alt="shem" src="img/web.jpg" />
+
+## Вид web-интерфейса принтера с установленной катушкой
+<img width="414" height="182" alt="shem" src="img/spoolman.jpgg" />
+
+
+
