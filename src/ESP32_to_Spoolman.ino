@@ -27,6 +27,7 @@
 #define BLUE 150
 #define GREEN 100
 #define YELLOW 30
+#define LIME 60
 
 CRGB leds[NUMLEDS];
 
@@ -302,7 +303,7 @@ void loop() {
     }
   }
   //При подключении WIFI и доступности серверов включаем светодиод
-  if (fl_led == false) {
+  if (fl_led == false) {    
     if (wifiSettingMode == 0 and WiFi.status() == WL_CONNECTED) {
       leds[0].setHue(BLUE);
       FastLED.show();
@@ -580,9 +581,11 @@ void SetSpool(int SetID) {
         Serial.println("Катушка с ID:" + String(SetID) + " успешно установлена");
         logger.println("Катушка с ID:" + String(SetID) + " успешно установлена");
         curent_filament_name(curentID);
+        set_led_color(LIME);  //Включаем светодиод
       } else {
         Serial.println("Ошибка установки катушки с ID: " + String(SetID));
         logger.println(sets::Logger::error() + "Ошибка установки катушки с ID: " + String(SetID));
+        set_led_color(RED);  //Включаем светодиод
       }
       sett.reload();
     } else {
