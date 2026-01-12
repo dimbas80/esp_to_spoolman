@@ -252,14 +252,12 @@ void setup() {
   if (mfrc522.PCD_PerformSelfTest()) {
     Serial.print("Найден считыватель RC522: ");
     MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, Serial);  // Show version of PCD - MFRC522 Card Reader.
-    //MFRC522Debug::PCD_DumpVersionToSerial();  // Show version of PCD - MFRC522 Card Reader.
-
     logger.print("Найден считыватель RC522: ");
     MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, logger);  // Show version of PCD - MFRC522 Card Reader.
     LED_NFC = true;
   } else {
-    Serial.print("Не найден считыватель RC522");
-    logger.println("Не найден считыватель RC522");
+    Serial.println("Не найден считыватель RC522");
+    logger.println(sets::Logger::error() + "Не найден считыватель RC522");
     LED_NFC = false;
   }
 }
@@ -285,12 +283,12 @@ void loop() {
   //Переодический сброс флага светодиода
   if (ResetLED.ready()) {
     fl_led = false;
-  }
+  } 
 
   //Читаем метку
   if (mfrc522.PCD_PerformSelfTest()) {
     readNFC();
-  } else resetMFRC();
+  } 
 
   //Мигаем светодиодом в режиме АР
   if (wifiSettingMode == 1) {
@@ -303,11 +301,11 @@ void loop() {
     }
   }
   //При подключении WIFI и доступности серверов включаем светодиод
-  if (fl_led == false) {    
+  if (fl_led == false and wifiSettingMode == 0) {    
     if (wifiSettingMode == 0 and WiFi.status() == WL_CONNECTED) {
       leds[0].setHue(BLUE);
       FastLED.show();
-      if (LED_MN == 1 and LED_SP == 1) {
+      if (LED_MN == 1 and LED_SP == 1 and LED_NFC == true) {
         leds[0].setHue(GREEN);
         FastLED.show();
       }
@@ -367,8 +365,16 @@ void resetMFRC() {
   Serial.println(F("Reboot RC522"));
   MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, Serial);
   if (mfrc522.PCD_PerformSelfTest()) {
+    Serial.println("Найден считыватель RC522: ");
+    MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, Serial);  // Show version of PCD - MFRC522 Card Reader.
+    logger.print("Найден считыватель RC522: ");
+    MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, logger);  // Show version of PCD - MFRC522 Card Reader.
     LED_NFC = true;
-  } else LED_NFC = false;
+  } else {
+    Serial.println("Не найден считыватель RC522");
+    logger.println(sets::Logger::error() + "Не найден считыватель RC522");
+    LED_NFC = false;
+  }
 }
 
 //Статус сервера
