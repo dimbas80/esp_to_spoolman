@@ -33,7 +33,13 @@
 <img width="414" height="182" alt="shem" src="img/spoolman.jpg" />
 
 ## Общий вид устройства
-Файлы для печати доступны 
+Файлы для печати доступны в папке cad
+
+Общий вид устройства в корпусе 
+
+<img width="640" height="480" alt="shem" src="img/foto1.jpg" />
+<img width="640" height="480" alt="shem" src="img/foto2.jpg" />
+<img width="640" height="480" alt="shem" src="img/foto3.jpg" />
 
 
 
