@@ -27,6 +27,7 @@
 #define BLUE 150
 #define GREEN 100
 #define YELLOW 30
+
 CRGB leds[NUMLEDS];
 
 //============= NFC MFRC522 ===============
@@ -38,8 +39,8 @@ CRGB leds[NUMLEDS];
 #define SS_PIN 5   // Configurable, see typical pin layout above
 
 MFRC522DriverPinSimple ss_pin(SS_PIN);  // Create pin driver. See typical pin layout above.
-MFRC522DriverSPI driver{ ss_pin };  // Create SPI driver.
-MFRC522 mfrc522{ driver };          // Create MFRC522 instance.
+MFRC522DriverSPI driver{ ss_pin };      // Create SPI driver.
+MFRC522 mfrc522{ driver };              // Create MFRC522 instance.
 
 //=================== DB ==================
 #include <GyverDBFile.h>
@@ -81,13 +82,13 @@ int curentID;               // ID текущей катушки
 const char* filament_name;  // Имя филамента
 bool wifiSettingMode = 0;   //Перемнная режима WIFI. 0 - SSID, 1 - AP
 bool fl_status = false;     //флаг статуса
-bool fl_led = false;     //флаг led
+bool fl_led = false;        //флаг led
 
 
 //===========Таймеры=====================
 #include <TimerMs.h>
-TimerMs T_LED_WIFI(500, 1, 0);  //Периодичность мигания светодиода WIFI
-TimerMs ResetLED(1000, 1, 0);  //Таймер сброса светодиода
+TimerMs T_LED_WIFI(500, 1, 0);   //Периодичность мигания светодиода WIFI
+TimerMs ResetLED(1000, 1, 0);    //Таймер сброса светодиода
 TimerMs RebootNFC(60000, 1, 0);  //Таймер сброса NFC против зависания
 
 //Интерфейс настроек
@@ -190,6 +191,13 @@ void setup() {
   db.init(web::id, 0);
   db.init(web::filament, "");
 
+  db[web::nfc_id] = 0;
+  db[web::nfc_name] = "";
+  db[web::nfc_brand] = "";
+  db[web::nfc_color] = "";
+  db[web::id] = 0;
+  db[web::filament] = "";
+
   //Входы выходы
   pinMode(SW_WIFI, INPUT_PULLUP);  //Кнопка сброса WIFI
 
@@ -266,13 +274,15 @@ void loop() {
   RebootNFC.tick();
 
 
-  //Переодический ребут считывателя
-  if (RebootNFC.ready()) {               
+  //Переодический ребут считывателя и проверка статуса серверов
+  if (RebootNFC.ready()) {
     resetMFRC();
+    statusServer();
+    curent_filament_name(curentID);
   }
 
   //Переодический сброс флага светодиода
-  if (ResetLED.ready()) {               
+  if (ResetLED.ready()) {
     fl_led = false;
   }
 
@@ -285,7 +295,7 @@ void loop() {
   if (wifiSettingMode == 1) {
     if (T_LED_WIFI.ready()) {
       leds[0].setHue(BLUE);
-  FastLED.show();
+      FastLED.show();
     } else {
       FastLED.clear();
       FastLED.show();
@@ -293,14 +303,17 @@ void loop() {
   }
   //При подключении WIFI и доступности серверов включаем светодиод
   if (fl_led == false) {
-  if (wifiSettingMode == 0 and WiFi.status() == WL_CONNECTED and LED_MN == 1 and LED_SP == 1) {
-    leds[0].setHue(GREEN);
-    FastLED.show();
-    FastLED.delay(1000);
-  } else{
-    leds[0].setHue(RED);
-    FastLED.show();
-  }
+    if (wifiSettingMode == 0 and WiFi.status() == WL_CONNECTED) {
+      leds[0].setHue(BLUE);
+      FastLED.show();
+      if (LED_MN == 1 and LED_SP == 1) {
+        leds[0].setHue(GREEN);
+        FastLED.show();
+      }
+    } else {
+      leds[0].setHue(RED);
+      FastLED.show();
+    }
   }
 
   //Читаем Serial если "status", то выводим статус серверов и текующую установленную катушку, если число, то устанавливаем катушку с числом если найдена
@@ -327,10 +340,10 @@ void loop() {
 =================================
 */
 //Светодиод WS2812
-void set_led_color (int color) {  
+void set_led_color(int color) {
   leds[0].setHue(color);
   FastLED.show();
-  fl_led = true;  
+  fl_led = true;
 }
 
 // Ошибка ответа сервера
@@ -649,7 +662,7 @@ void readNFC() {
     resetMFRC();
     return;
   }
-  set_led_color(YELLOW); //Включаем желтый светодиод
+  set_led_color(YELLOW);  //Включаем желтый светодиод
   //Перемнные метки NFC
   const char* sm_id;      // "ID филамента"
   const char* color_hex;  // "Цвет в HEX"
@@ -671,6 +684,6 @@ void readNFC() {
   Serial.println("Прочитана метка с ID:" + String(sm_id) + " Тип:" + String(type));
   logger.println("Прочитана метка с ID:" + String(sm_id) + " Тип:" + String(type));
 
-  SetSpool(atoi(sm_id));  //Устанавливаем активной катушку из метки  
+  SetSpool(atoi(sm_id));  //Устанавливаем активной катушку из метки
   return;
 }
