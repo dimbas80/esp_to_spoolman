@@ -230,6 +230,7 @@ void setup() {
     Serial.print(F("IP: "));
     Serial.println(WiFi.localIP());
     server.begin();
+    WiFi.softAPdisconnect(true);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -695,4 +696,5 @@ void readNFC() {
 
   SetSpool(atoi(sm_id));  //Устанавливаем активной катушку из метки
   return;
+
 }
