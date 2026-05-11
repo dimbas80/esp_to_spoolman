@@ -67,6 +67,7 @@ DB_KEYS(
   led_sp,
   led_mn,
   led_nfc,
+  sw_mmu,
   id,
   filament,
   nfc_id,
@@ -84,6 +85,7 @@ const char* filament_name;  // Имя филамента
 bool wifiSettingMode = 0;   //Перемнная режима WIFI. 0 - SSID, 1 - AP
 bool fl_status = false;     //флаг статуса
 bool fl_led = false;        //флаг led
+bool mmu = false;        //включение отправки данныех в MMU
 
 
 //===========Таймеры=====================
@@ -101,7 +103,7 @@ void build(sets::Builder& b) {
   }
   {
     sets::Group g(b, "Сервера");
-    if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {  //, db[web::serverSpoolman], sets::Code::regex = ("Введите IP адрес сервера Spoolman с указанием порта"));) {
+    if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {  
       logger.println("Set IP:Port Spoolman:" + String(db[web::serverSpoolman]));
       db.update();
       //statusServer();
@@ -112,6 +114,9 @@ void build(sets::Builder& b) {
       db.update();
       //statusServer();
     }
+    //Переключатель MMU
+    (b.Switch(web::sw_mmu, "Устанавливать в MMU (Happy Hare)", &mmu));
+      
     if (b.Button(web::apply1, "Save & Restart")) {
       db.update();  // сохраняем БД не дожидаясь таймаута
       ESP.restart();
@@ -191,7 +196,7 @@ void setup() {
   db.init(web::nfc_color, "");
   db.init(web::id, 0);
   db.init(web::filament, "");
-
+  db[web::sw_mmu] = 0;
   db[web::nfc_id] = 0;
   db[web::nfc_name] = "";
   db[web::nfc_brand] = "";
@@ -284,12 +289,12 @@ void loop() {
   //Переодический сброс флага светодиода
   if (ResetLED.ready()) {
     fl_led = false;
-  } 
+  }
 
   //Читаем метку
   if (mfrc522.PCD_PerformSelfTest()) {
     readNFC();
-  } 
+  }
 
   //Мигаем светодиодом в режиме АР
   if (wifiSettingMode == 1) {
@@ -302,7 +307,7 @@ void loop() {
     }
   }
   //При подключении WIFI и доступности серверов включаем светодиод
-  if (fl_led == false and wifiSettingMode == 0) {    
+  if (fl_led == false and wifiSettingMode == 0) {
     if (wifiSettingMode == 0 and WiFi.status() == WL_CONNECTED) {
       leds[0].setHue(BLUE);
       FastLED.show();
@@ -604,7 +609,39 @@ void SetSpool(int SetID) {
   return;
 }
 
-// //Чтение NFC метки
+// Задание следующей катушки с ID в MMU Happy Hare
+void mmu_next_spoolid(int SetID) {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (getIDSpool(SetID)) {
+      //WiFiClient client;
+      HTTPClient http;
+
+      // Формируем URL для API Moonraker
+      String url = "http://" + String(db[web::serverMoonraker]) + "/printer/gcode/script";
+
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+
+      // Формируем JSON с командой для Happy Hare
+      // Команда: MMU_GATE_MAP GATE=x NEXT_SPOOLID=y
+      String httpRequestData = "{\"script\":\"MMU_GATE_MAP NEXT_SPOOLID=" + String(SetID) + "\"}";
+
+      int httpResponseCode = http.POST(httpRequestData);
+
+      if (httpResponseCode > 0) {
+        Serial.println("Установка катушки с ID в MMU: " + String(SetID));
+        logger.println("Установка катушки с ID в MMU: " + String(SetID));
+        set_led_color(LIME);  //Включаем светодиод
+      } else {
+        Serial.println("Ошибка установки катушки с ID в MMU: " + String(SetID));
+        logger.println(sets::Logger::error() + "Ошибка установки катушки с ID в MMU: " + String(SetID));
+        set_led_color(RED);  //Включаем светодиод
+      }
+      http.end();
+    }
+  }
+}
+//Чтение NFC метки
 void readNFC() {
 
   if (!mfrc522.PICC_IsNewCardPresent()) {
@@ -680,6 +717,7 @@ void readNFC() {
   const char* min_temp;   // "Мин температураа"
   const char* max_temp;   // "Макс температура"
   const char* brand;      // "Производитель "
+  const char* mmu_gate;   // "Ворота MMU "
 
   sm_id = doc["sm_id"];          // "8"
   color_hex = doc["color_hex"];  // "0015ff"
@@ -695,6 +733,8 @@ void readNFC() {
   logger.println("Прочитана метка с ID:" + String(sm_id) + " Тип:" + String(type));
 
   SetSpool(atoi(sm_id));  //Устанавливаем активной катушку из метки
+  if (mmu == true) {
+    mmu_next_spoolid(atoi(sm_id));  //Устанавливаем катушку в ворота MMU
+  }
   return;
-
 }
