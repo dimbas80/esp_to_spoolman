@@ -85,7 +85,7 @@ const char* filament_name;  // Имя филамента
 bool wifiSettingMode = 0;   //Перемнная режима WIFI. 0 - SSID, 1 - AP
 bool fl_status = false;     //флаг статуса
 bool fl_led = false;        //флаг led
-bool mmu = false;        //включение отправки данныех в MMU
+bool mmu = false;           //включение отправки данныех в MMU
 
 
 //===========Таймеры=====================
@@ -103,7 +103,7 @@ void build(sets::Builder& b) {
   }
   {
     sets::Group g(b, "Сервера");
-    if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {  
+    if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {
       logger.println("Set IP:Port Spoolman:" + String(db[web::serverSpoolman]));
       db.update();
       //statusServer();
@@ -115,8 +115,12 @@ void build(sets::Builder& b) {
       //statusServer();
     }
     //Переключатель MMU
-    (b.Switch(web::sw_mmu, "Устанавливать в MMU (Happy Hare)", &mmu));
-      
+    if (b.Switch(web::sw_mmu, "Устанавливать в MMU (Happy Hare)", &mmu)) {
+      // Если по клику на переключатель мы хотим сохранить значение сразу:
+      db[web::sw_mmu] = mmu;  // Синхронизируем значение с базой данных
+      db.update();            // Записываем в ПЗУ
+    }
+
     if (b.Button(web::apply1, "Save & Restart")) {
       db.update();  // сохраняем БД не дожидаясь таймаута
       ESP.restart();
@@ -196,7 +200,7 @@ void setup() {
   db.init(web::nfc_color, "");
   db.init(web::id, 0);
   db.init(web::filament, "");
-  db[web::sw_mmu] = 0;
+  mmu = db[web::sw_mmu]; 
   db[web::nfc_id] = 0;
   db[web::nfc_name] = "";
   db[web::nfc_brand] = "";
