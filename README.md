@@ -43,5 +43,20 @@
 <img width="640" height="480" alt="shem" src="img/foto2.jpg" />
 <img width="640" height="480" alt="shem" src="img/foto3.jpg" />
 
+## Changelog
 
+### v1.2
+- Исправлен критический баг: `PCD_PerformSelfTest()` вызывался в каждом loop(), приводя к нестабильной работе MFRC522. Self-test теперь только при инициализации и в watchdog (30с).
+- Исправлен баг поиска spool_id — заменён на прямой запрос `/api/v1/spool/{id}`.
+- Убраны множественные `http.end()` в `SetSpool()`.
+- Добавлен WiFi auto-reconnect при потере связи (30с).
+- Добавлен дебаунс NFC по UID-хешу.
+- Добавлен watchdog MFRC522 — self-test каждые 30с, при зависании аппаратный сброс.
+- Защита от HTTP-блокировок: `setTimeout(1500)` + retry-delay 30с.
+- Logger пишет только при смене состояния сервера или смене катушки.
+- LED переработан: `updateLED()` каждый loop().
+- FastLED заменён на Adafruit NeoPixel. Для ESP32-C3: `PartitionScheme=no_ota`.
+- USB Serial: `CDCOnBoot=cdc`.
+- Явно заданы SPI-пины для RC522 под ESP32-C3.
+- Реструктуризация проекта: `.ino` + `.h` + `.cpp` — обход бага GTL.h.
 
