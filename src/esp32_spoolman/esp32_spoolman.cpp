@@ -45,6 +45,21 @@ unsigned long lastMoonrakerFail = 0;
 bool prevSpoolmanOk = false;
 bool prevMoonrakerOk = false;
 
+//D22 (диагностика): PCD_PerformSelfTest() начинается с PCD_Reset(), который возвращает RFCfgReg
+//к дефолту (0x40 = 33 dB) и сбрасывает выставленный при старте 0x70 (48 dB). Гипотеза отказа
+//MIFARE_Read — деградация усиления приёма после самотеста; без лога gain это не проверить.
+//always=false — печатать только при смене значения (тик watchdog раз в 30 с не должен спамить).
+static void logReaderGain(const char* after, bool always) {
+  static uint8_t lastGain = 0xFF;
+  uint8_t gain = mfrc522.PCD_GetAntennaGain();
+  if (!always && gain == lastGain) return;
+  lastGain = gain;
+  String msg = String("RC522 gain ") + after + ": 0x" + String(gain, HEX);
+  if (gain != 0x70) msg += " (не 0x70: самотест вернул RxGain в дефолт)";
+  Serial.println(msg);
+  logger.println(gain == 0x70 ? msg : sets::Logger::warn() + msg);
+}
+
 TimerMs T_LED_WIFI(500, 1, 0);
 TimerMs ResetLED(1000, 1, 0);
 TimerMs WatchdogNFC(30000, 1, 0);
@@ -364,6 +379,7 @@ void setup() {
     logger.println(sets::Logger::error() + "Не найден считыватель RC522");
     LED_NFC = false;
   }
+  logReaderGain("после самотеста (boot)", true);  //D22: фактический RxGain после PCD_Reset внутри самотеста
 }
 
 void loop() {
@@ -386,6 +402,8 @@ void loop() {
       Serial.println("NFC reader hang detected, resetting...");
       logger.println(sets::Logger::error() + "NFC reader hang detected, resetting...");
       resetMFRC();
+    } else {
+      logReaderGain("после самотеста (watchdog)", false);  //D22: печатаем только при смене (самотест сбрасывает gain)
     }
   }
 
@@ -459,6 +477,7 @@ void resetMFRC() {
     logger.println(sets::Logger::error() + "Не найден считыватель RC522");
     LED_NFC = false;
   }
+  logReaderGain("после самотеста (reset)", true);  //D22
 }
 
 void statusServer() {
@@ -779,6 +798,9 @@ String formatUID() {
   return uid;
 }
 
+//D22: диагностика NFC собирается здесь же (struct и определения — в секции «D22» ниже)
+static void nfcDiagNoteRead(uint8_t page, uint8_t status);
+
 //Payload NDEF-записи (application/json у openspool/FilaMan). «» — если TLV/запись не распарсились.
 //Читаем страницы с 4-й кусками по 4 страницы (MIFARE_Read отдаёт 16 байт + 2 CRC),
 //пока не исчерпана TLV-длина, не встретится 0xFE, не кончится память метки или лимит NDEF_MAX_BYTES.
@@ -789,7 +811,9 @@ String ndefPayload() {
 
   for (uint16_t page = NDEF_PAGE_START; memLen < NDEF_MAX_BYTES; page += 4) {
     byte byteCount = sizeof(buffer);
-    if (mfrc522.MIFARE_Read((byte)page, buffer, &byteCount) != MFRC522::StatusCode::STATUS_OK) {
+    MFRC522::StatusCode readStatus = mfrc522.MIFARE_Read((byte)page, buffer, &byteCount);
+    if (readStatus != MFRC522::StatusCode::STATUS_OK) {
+      nfcDiagNoteRead((uint8_t)page, (uint8_t)readStatus);  //D22: первая ошибка чтения за касание
       break;  //дальше страниц нет (NTAG213/215) либо ошибка чтения
     }
     for (byte i = 0; i < 16 && memLen < NDEF_MAX_BYTES; i++) {
@@ -810,6 +834,51 @@ String ndefPayload() {
   }
   return "";
 }
+
+//=== D22: диагностика NFC — ATQA/SAK, статусы проб типа чипа, первый отказ чтения, CC ===
+
+//Собирается за одно касание и печатается ОДИН раз на UID (анти-спам): только если за касание
+//случился отказ MIFARE_Read. Цель — по логам владельца увидеть, почему метка не читается:
+//ATQA/SAK показывают, опознана ли карта вообще, статусы проб 226/130/40 — виден ли тип чипа,
+//первый отказ чтения и CC — где именно рассыпается обмен.
+struct NfcDiag {
+  bool triggered;         //был отказ MIFARE_Read (проба типа либо страница данных/CC)
+  bool dataFailed;        //отказ именно чтения данных: firstErrPage/firstErrStatus заполнены
+  uint8_t firstErrPage;
+  uint8_t firstErrStatus;
+  uint8_t probePage[3];   //страницы проб tagChipInfo: 226 -> 130 -> 40
+  uint8_t probeStatus[3];
+  uint8_t probeCnt;
+};
+static NfcDiag nfcDiag;
+static String nfcDiagLoggedUID;  //UID, для которого диагностика уже напечатана
+
+static void nfcDiagReset() {
+  nfcDiag = NfcDiag();
+}
+
+//Отказ чтения страницы: запоминаем первую ошибку за касание
+static void nfcDiagNoteRead(uint8_t page, uint8_t status) {
+  if (status == (uint8_t)MFRC522::StatusCode::STATUS_OK) return;
+  nfcDiag.triggered = true;
+  if (nfcDiag.dataFailed) return;
+  nfcDiag.dataFailed = true;
+  nfcDiag.firstErrPage = page;
+  nfcDiag.firstErrStatus = status;
+}
+
+//Проба типа чипа (tagChipInfo): статус каждой попытки идёт в тот же лог
+static void nfcDiagProbe(uint8_t page, uint8_t status) {
+  if (nfcDiag.probeCnt < 3) {
+    nfcDiag.probePage[nfcDiag.probeCnt] = page;
+    nfcDiag.probeStatus[nfcDiag.probeCnt] = status;
+    nfcDiag.probeCnt++;
+  }
+  if (status != (uint8_t)MFRC522::StatusCode::STATUS_OK) nfcDiag.triggered = true;
+}
+
+//Определение — в секции «Запись метки v1.3»: нужны tagChipInfo()/pageHex()
+static void nfcDiagLogOnce(const String& uid);
 
 //UID-first: POST /api/v1/tag/scan {"uid":...,"reader_id":"esp32-to-spoolman"}.
 //true — Spoolman нашёл линковку UID -> катушка (*matched = matched_spool_id).
@@ -927,6 +996,7 @@ void readNFC() {
   String uid = formatUID();
   Serial.print("Метка UID: ");
   Serial.println(uid);
+  nfcDiagReset();  //D22: диагностика собирается заново на каждое касание (лог — один на UID)
 
   //Содержимое метки читаем всегда: из него заполняются поля (nfc_* либо w_*)
   String payload = ndefPayload();
@@ -958,6 +1028,7 @@ void readNFC() {
     }
 
     mfrc522.PICC_HaltA();
+    nfcDiagLogOnce(uid);  //D22: один лог на UID при первом отказе чтения
     sett.reload();
     return;
   }
@@ -976,10 +1047,21 @@ void readNFC() {
   }
 
   mfrc522.PICC_HaltA();
+  nfcDiagLogOnce(uid);  //D22: диагностика до HTTP — лог идёт в порядке касания
 
   //1) UID-first: линковка UID -> катушка в Spoolman имеет приоритет над содержимым метки (D2)
   int matched = -1;
   if (spoolIDByUID(uid, matched)) {
+    //D20: линковка UID есть, а содержимого на метке нет (пусто / JSON невалиден / формат не
+    //распознан) — катушку НЕ устанавливаем и MMU не трогаем: привязка UID сама по себе не
+    //означает, что метка несёт данные катушки.
+    if (!parsed) {
+      String why = payload.length() ? " (содержимое не распознано)" : "";
+      Serial.println("Метка " + uid + ": метка пустая, UID привязан к spool ID " + String(matched) + ", катушка не установлена" + why);
+      logger.println(sets::Logger::warn() + "Метка " + uid + ": метка пустая, UID привязан к spool ID " + String(matched) + ", катушка не установлена" + why);
+      set_led_color(YELLOW);  //D20: жёлтый, не зелёный — катушка не установлена
+      return;
+    }
     Serial.println("Метка привязана к катушке ID:" + String(matched));
     logger.println("Метка " + uid + " привязана к катушке ID:" + String(matched));
     set_led_color(YELLOW);
@@ -1208,11 +1290,14 @@ struct TagChipInfo {
   uint8_t dataLastPage;  //последняя страница данных по CC
 };
 
-//Страница читается (нет NAK по несуществующему адресу) — так определяется тип чипа
+//Страница читается (нет NAK по несуществующему адресу) — так определяется тип чипа.
+//D22: статус каждой пробы уходит в диагностику (один лог на UID).
 static bool tagPageReadable(byte page) {
   uint8_t buf[18];
   byte n = sizeof(buf);
-  return mfrc522.MIFARE_Read(page, buf, &n) == MFRC522::StatusCode::STATUS_OK;
+  MFRC522::StatusCode status = mfrc522.MIFARE_Read(page, buf, &n);
+  nfcDiagProbe((uint8_t)page, (uint8_t)status);
+  return status == MFRC522::StatusCode::STATUS_OK;
 }
 
 //Тип чипа по наличию служебных страниц: 216 -> 226h, 215 -> 82h, 213 -> 28h
@@ -1256,24 +1341,103 @@ static String byteHex(uint8_t v) {
   return out;
 }
 
-//D7: проверка запрета записи ДО любой записи в метку (статическая защита, динамическая, PROT, пароль, CC).
-//true — состояние чипа определено (writable: можно писать); false — чип не NTAG21x либо не читается.
-bool tagLockCheck(bool& writable) {
-  writable = false;
+//D22: один диагностический лог на UID при первом отказе MIFARE_Read за касание.
+//ATQA/SAK — опознаётся ли карта вообще; статусы проб 226/130/40 — виден ли тип чипа;
+//первая ошибка чтения страницы и CC (стр. 3) — где рассыпается обмен.
+//Карта к этому моменту в HALT: HALT -> WUPA (возвращает ATQA) -> SELECT, чтобы пробы и чтение
+//CC шли на выбранной карте; в конце снова HALT.
+static void nfcDiagLogOnce(const String& uid) {
+  if (!uid.length() || !nfcDiag.triggered) return;  //отказов чтения не было — диагностика не нужна
+  if (nfcDiagLoggedUID == uid) return;              //анти-спам: один лог на UID
+  nfcDiagLoggedUID = uid;
 
+  uint8_t sak = mfrc522.uid.sak;
+  uint8_t atqa[2] = { 0, 0 };
+  byte atqaSize = sizeof(atqa);
+  mfrc522.PICC_HaltA();
+  uint8_t atqaStatus = (uint8_t)mfrc522.PICC_WakeupA(atqa, &atqaSize);
+  bool selected = atqaStatus == (uint8_t)MFRC522::StatusCode::STATUS_OK && mfrc522.PICC_ReadCardSerial();
+
+  //В read-режиме тип чипа иначе не проверяется — пробы 226/130/40 дают ту же картину, что при записи
+  if (selected && !nfcDiag.probeCnt) {
+    TagChipInfo chip;
+    tagChipInfo(chip);
+  }
+
+  uint8_t cc[18] = { 0 };
+  byte ccSize = sizeof(cc);
+  MFRC522::StatusCode ccRead = mfrc522.MIFARE_Read(3, cc, &ccSize);  //CC-байты стр. 3
+  mfrc522.PICC_HaltA();
+
+  String line = "NFC диагностика " + uid + ": ATQA=";
+  if (atqaStatus == (uint8_t)MFRC522::StatusCode::STATUS_OK) {
+    line += byteHex(atqa[0]);
+    line += ' ';
+    line += byteHex(atqa[1]);
+  } else {
+    line += "нет (status 0x";
+    line += byteHex(atqaStatus);
+    line += ')';
+  }
+  line += " SAK=0x";
+  line += byteHex(sak);
+
+  line += " | пробы:";
+  if (!nfcDiag.probeCnt) {
+    line += " нет (карта не выбрана)";
+  } else {
+    for (uint8_t i = 0; i < nfcDiag.probeCnt; i++) {
+      line += ' ';
+      line += String(nfcDiag.probePage[i]);
+      line += "=0x";
+      line += byteHex(nfcDiag.probeStatus[i]);
+    }
+  }
+
+  line += " | первая ошибка чтения: ";
+  if (nfcDiag.dataFailed) {
+    line += "стр. ";
+    line += String(nfcDiag.firstErrPage);
+    line += " status=0x";
+    line += byteHex(nfcDiag.firstErrStatus);
+  } else {
+    line += "нет (только пробы типа)";
+  }
+
+  line += " | CC: ";
+  if (ccRead == MFRC522::StatusCode::STATUS_OK) {
+    line += pageHex(cc, 4);
+    line += " (status=0x00)";
+  } else {
+    line += "нет (status 0x";
+    line += byteHex((uint8_t)ccRead);
+    line += ')';
+  }
+
+  Serial.println(line);
+  logger.println(sets::Logger::warn() + line);
+}
+
+//D7: проверка запрета записи ДО любой записи в метку (статическая защита, динамическая, PROT, пароль, CC).
+//D21: результат ТРЁХсоставный. «Чип не опознан» — это не read-only, а неизвестное состояние:
+//вызывающий код не имеет права ни писать в чип, ни делать HTTP-эффекты (линковку/отвязку).
+TagLockState tagLockCheck() {
   TagChipInfo chip;
   if (!tagChipInfo(chip)) {
     Serial.println("Метка: тип чипа не определён (не NTAG21x)");
-    logger.println(sets::Logger::error() + "Метка: тип чипа не определён (не NTAG21x), запись запрещена");
-    return false;
+    logger.println(sets::Logger::error() + "Метка: тип чипа не определён (не NTAG21x), состояние чипа неизвестно");
+    return TAG_LOCK_CHIP_UNKNOWN;
   }
 
   //Статическая защита (стр. 2, байты 2-3): Lx запирает страницу x (3..15); CC — стр. 3 из того же чтения
   uint8_t buf[18];
   byte n = sizeof(buf);
-  if (mfrc522.MIFARE_Read(2, buf, &n) != MFRC522::StatusCode::STATUS_OK) {
-    logger.println(sets::Logger::error() + "Метка " + String(chip.name) + ": не читается стр. 2 (lock/CC)");
-    return false;
+  MFRC522::StatusCode lockRead = mfrc522.MIFARE_Read(2, buf, &n);
+  if (lockRead != MFRC522::StatusCode::STATUS_OK) {
+    nfcDiagNoteRead(2, (uint8_t)lockRead);
+    //Без lock-битов и CC запись может испортить метку: состояние неизвестно (не read-only!)
+    logger.println(sets::Logger::error() + "Метка " + String(chip.name) + ": не читается стр. 2 (lock/CC) — состояние чипа неизвестно");
+    return TAG_LOCK_CHIP_UNKNOWN;
   }
   uint8_t lock0 = buf[2];
   uint8_t lock1 = buf[3];
@@ -1284,8 +1448,11 @@ bool tagLockCheck(bool& writable) {
   //Динамическая защита (стр. 40/130/226, байты 0-2): страницы 16h и далее
   bool dynLocked = false;
   n = sizeof(buf);
-  if (mfrc522.MIFARE_Read(chip.dynLockPage, buf, &n) == MFRC522::StatusCode::STATUS_OK) {
+  MFRC522::StatusCode dynRead = mfrc522.MIFARE_Read(chip.dynLockPage, buf, &n);
+  if (dynRead == MFRC522::StatusCode::STATUS_OK) {
     dynLocked = buf[0] || buf[1] || buf[2];
+  } else {
+    nfcDiagNoteRead(chip.dynLockPage, (uint8_t)dynRead);
   }
 
   //AUTH0 (байт 3 первой страницы конфигурации): FFh — пароль не используется
@@ -1318,8 +1485,8 @@ bool tagLockCheck(bool& writable) {
     logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + ": CC заперт и не NDEF, запись запрещена");
   }
 
-  writable = !(staticLocked || dynLocked || prot || passworded || (ccLocked && !ccValid));
-  return true;
+  bool blocked = staticLocked || dynLocked || prot || passworded || (ccLocked && !ccValid);
+  return blocked ? TAG_LOCK_LOCKED : TAG_LOCK_WRITABLE;
 }
 
 //NDEF-сообщение для записи: TLV 0x03 (+ 0xFF len16 при длине > 254) + запись application/json
@@ -1688,19 +1855,22 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
   }
   logger.println("Запись метки " + uid + " -> катушка ID:" + String(spoolID));
 
-  //1) D7/D14: сначала lock-проверка (как в спецификации: UID + lock -> потом payload).
-  //Запертая либо неопознанная метка — содержимое не пишем, UID линкуем.
-  bool writable = false;
-  bool chipOk = tagLockCheck(writable);
-  if (!chipOk || !writable) {
-    String what = chipOk ? String("read-only (lock-биты), содержимое не записано") : String("не записана (чип не опознан)");
-    if (linkWithConflict(uid, spoolID)) {
-      Serial.println("Метка " + uid + " " + what + ", UID привязан к ID:" + String(spoolID));
-      logger.println(sets::Logger::warn() + "Метка " + uid + " " + what + ", UID привязан к ID:" + String(spoolID));
-      setWriteResult(LIME);
-    } else {
-      setWriteResult(RED);
-    }
+  //1) D7/D21: сначала lock-проверка (как в спецификации: UID + lock -> потом payload).
+  //D21: UID-линковка возможна ТОЛЬКО после подтверждённой записи NDEF, поэтому любой отказ
+  //lock-проверки завершает операцию до HTTP (readSpoolForTag/linkWithConflict не вызываются).
+  TagLockState lock = tagLockCheck();
+  if (lock == TAG_LOCK_CHIP_UNKNOWN) {
+    //«Чип не опознан» — состояние неизвестно: ни записи, ни привязки (D21)
+    Serial.println("Запись метки " + uid + ": чип не опознан, запись не выполнена, UID не привязан");
+    logger.println(sets::Logger::error() + "Запись метки " + uid + ": чип не опознан — запись не выполнена, UID не привязан (катушка ID:" + String(spoolID) + " не тронута)");
+    setWriteResult(RED);
+    return;
+  }
+  if (lock == TAG_LOCK_LOCKED) {
+    //D21: содержимое не записано — значит и UID не линкуем (привязка без записи запрещена)
+    Serial.println("Запись метки " + uid + ": метка read-only, запись не выполнена, UID не привязан");
+    logger.println(sets::Logger::warn() + "Запись метки " + uid + ": метка read-only — содержимое не записано, UID не привязан к ID:" + String(spoolID));
+    setWriteResult(RED);
     return;  //поля w_* уже отражают фактическое содержимое метки (её не меняли)
   }
 
@@ -1902,14 +2072,18 @@ bool eraseTag() {
   Serial.println("Стирание метки: UID " + uid);
   logger.println("Стирание метки " + uid);
 
-  //1) D7/D14: запертую метку не трогаем — только отвязываем UID
-  bool writable = false;
-  bool chipOk = tagLockCheck(writable);
+  //1) D7/D14/D21: трёхсоставный lock-результат.
+  //CHIP_UNKNOWN -> полный abort: ни wipe, ни отвязки (состояние чипа неизвестно, D21).
+  //LOCKED (read-only) -> wipe невозможен, отвязка UID выполняется с честным логом (D14).
+  TagLockState lock = tagLockCheck();
+  if (lock == TAG_LOCK_CHIP_UNKNOWN) {
+    Serial.println("Стирание метки " + uid + ": чип не опознан, стирание и отвязка отменены");
+    logger.println(sets::Logger::error() + "Стирание метки " + uid + ": чип не опознан — содержимое не стёрто, UID не отвязан");
+    return false;
+  }
   bool chipWiped = false;
-  if (!chipOk) {
-    logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": чип не опознан, содержимое не стёрто");
-  } else if (!writable) {
-    logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": чип read-only, содержимое не стёрто");
+  if (lock == TAG_LOCK_LOCKED) {
+    logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": чип read-only (lock-биты), wipe невозможен — отвязываем UID");
   } else {
     TagChipInfo chip;
     tagChipInfo(chip);

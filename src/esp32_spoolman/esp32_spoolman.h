@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3"
+#define VER "1.3.1"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
@@ -155,7 +155,14 @@ bool fetchSpoolList(bool noTagOnly);  //GET /api/v1/spool?allow_archived=false -
 int selectedSpoolID();               //id из spool_ids по индексу spool_sel; -1 если ничего не выбрано
 
 //Запись метки v1.3 (D5–D9, D13–D16)
-bool tagLockCheck(bool& writable);  //lock-биты/CC/PROT до записи; writable=false при любом запрете
+//D21: результат lock-проверки — ТРИ состояния. «Чип не опознан» — это не read-only:
+//состояние чипа неизвестно, поэтому ни записи, ни HTTP-эффектов (линковка/отвязка) быть не может.
+enum TagLockState {
+  TAG_LOCK_WRITABLE,     //чип NTAG21x опознан, запретов записи не найдено
+  TAG_LOCK_LOCKED,       //чип опознан, но запись запрещена (lock-биты / PROT / AUTH0 / CC)
+  TAG_LOCK_CHIP_UNKNOWN  //тип чипа либо lock/CC не читаются — состояние неизвестно
+};
+TagLockState tagLockCheck();  //lock-биты/CC/PROT до записи (D7); D21 — трёхсоставный результат
 bool writeNDEF(const String& payload);  //CC + TLV + запись по страницам + перечитывание для подтверждения
 bool linkTagUID(const String& uid, int spoolID, String& holderID);  //POST /spool/{id}/tag; 409 -> holderID
 bool unlinkTagUID(const String& uid, int spoolID);                  //DELETE /spool/{id}/tag/{uid} (D13/D9)
