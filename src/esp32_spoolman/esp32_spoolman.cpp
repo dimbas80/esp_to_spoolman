@@ -31,6 +31,7 @@ bool fl_status = false;
 bool fl_led = false;
 bool mmu = false;
 bool writeMode = false;  //D10: режим записи — активация катушки/MMU/tag-scan заблокированы
+uint8_t activePage = PAGE_MAIN;  //D18: страница, открытая в вебморде (Tabs больше нет)
 uint32_t lastUID = 0;
 //Машина записи (D16): ожидание метки после нажатия кнопки + таймаут 60 с
 WriteState wstate = IDLE;
@@ -64,28 +65,55 @@ static void resetWriteState() {
   conflictSpool = 0;
 }
 
-//Интерфейс настроек
+//Интерфейс (D18): корень build() — главная страница, два подменю — «Записать метку» и
+//«Настройки». Tabs не используются: переключение меню мгновенное, а build() вызывается
+//библиотекой и при входе в меню (Build::Type::Menu + b.enterMenu() нужного блока).
 void build(sets::Builder& b) {
-  //Табы: 0 — настройки, 1 — «Записать метку» (b.Tabs отдаёт индекс опции)
-  int tab = db[web::tab];
-  if (b.Tabs(web::tab, "Настройки;Записать метку")) {
-    tab = db[web::tab];  //SettingsBase пишет значение в БД до вызова build()
-    resetWriteState();
-    if (tab == 1) {
-      logger.println("Режим записи: активация катушки заблокирована");
-      fetchSpoolList((bool)db[web::f_notag]);
-    } else {
-      logger.println("Режим настроек: активация катушки разрешена");
+  const bool menuAction = (b.build.type == sets::Build::Type::Menu);
+  bool enteredWrite = false;
+  bool enteredSettings = false;
+
+  //==== Главная страница: доступность сервисов и считывателя, катушка, метка, логгер ====
+  {
+    sets::Group g(b, "Доступность");
+    b.LED(web::led_mn, "Статус Moonraker", LED_MN, sets::Colors::Yellow, sets::Colors::Green);
+    b.LED(web::led_sp, "Статус Spoolman", LED_SP, sets::Colors::Yellow, sets::Colors::Green);
+    b.LED(web::led_nfc, "NFC считыватель", LED_NFC, sets::Colors::Yellow, sets::Colors::Green);
+    //Проверка доступности: loop() по флагу дёргает statusServer() + curent_filament_name()
+    if (b.Button(web::apply2, "Проверка доступности")) {
+      fl_status = true;
     }
   }
+  {
+    sets::Group g(b, "Текущая катушка установленная в SpoolMan");
+    b.Label(web::id, "ID:");
+    b.Label(web::filament, "Имя:");
+  }
+  {
+    sets::Group g(b, "NFC Метка");
+    b.Label(web::nfc_id, "ID:");
+    b.Label(web::nfc_uid, "UID:");
+    b.Label(web::nfc_name, "Материал:");
+    b.Label(web::nfc_brand, "Производитель:");
+    b.Label(web::nfc_color, "Цвет:");
+  }
+  {
+    sets::Group g(b, "Логгер");
+    b.Log(H(log), logger);
+  }
 
-  if (tab == 1) {
-    //==== Подменю «Записать метку» (D10: только чтение метки, активация заблокирована) ====
+  //==== Подменю «Записать метку» (D10: только чтение метки, активация заблокирована) ====
+  //beginMenu/endMenu парные: первый виджет внутри меню попадает на отдельную страницу вебморды
+  if (b.beginMenu("Записать метку")) {
+    enteredWrite = menuAction && b.enterMenu();
     {
       sets::Group g(b, "Катушка для записи");
       if (b.Switch(web::f_notag, "Только катушки без метки")) {
         db[web::spool_sel] = 0;  //после смены фильтра индексы опций другие
         fetchSpoolList((bool)db[web::f_notag]);
+        //Опции Select приходят только в пакете сборки страницы — перерисовываем её
+        //(reload без force оставляет вебморду на этом же меню)
+        b.reload();
       }
       String opts = db[web::spool_opts];
       b.Select(web::spool_sel, "Катушка", opts);
@@ -128,59 +156,70 @@ void build(sets::Builder& b) {
         logger.println("Стирание метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
       }
     }
-    {
-      sets::Group g(b, "Логгер");
-      b.Log(H(log), logger);
-    }
-    return;
+    b.endMenu();
   }
 
-  {
-    sets::Group g(b, "WiFi");
-    b.Input(web::wifi_ssid, "SSID");
-    b.Pass(web::wifi_pass, "Password");
+  //==== Подменю «Настройки»: wifi, серверы Spoolman/Moonraker, версия устройства ====
+  if (b.beginMenu("Настройки")) {
+    enteredSettings = menuAction && b.enterMenu();
+    {
+      sets::Group g(b, "WiFi");
+      b.Input(web::wifi_ssid, "SSID");
+      b.Pass(web::wifi_pass, "Password");
+      //Режим задаётся переключателем SW_WIFI на плате при старте: AP — настройка, STA — работа в сети
+      b.Label("Режим:", wifiSettingMode ? "AP (точка доступа)" : "STA (клиент сети)");
+    }
+    {
+      sets::Group g(b, "Сервера");
+      if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {
+        logger.println("Set IP:Port Spoolman:" + String(db[web::serverSpoolman]));
+        db.update();
+      }
+      if (b.Input(web::serverMoonraker, "IP:Port Moonraker(Принтер)")) {
+        logger.println("Set IP:Port Moonraker(Принтер):" + String(db[web::serverMoonraker]));
+        db.update();
+      }
+      if (b.Switch(web::sw_mmu, "Устанавливать в MMU (Happy Hare)", &mmu)) {
+        db[web::sw_mmu] = mmu;
+        db.update();
+      }
+      if (b.Button(web::apply1, "Save & Restart")) {
+        db.update();
+        LittleFS.end();
+        delay(100);
+        ESP.restart();
+      }
+    }
+    {
+      sets::Group g(b, "Устройство");
+      b.Label("Версия прошивки:", VER);
+    }
+    b.endMenu();
   }
-  {
-    sets::Group g(b, "Сервера");
-    if (b.Input(web::serverSpoolman, "IP:Port Spoolman")) {
-      logger.println("Set IP:Port Spoolman:" + String(db[web::serverSpoolman]));
-      db.update();
+
+  //==== Смена страницы (D18) ====
+  //Вход в меню библиотека сообщает вызовом build() с типом Menu; возврат на главную — Menu,
+  //в котором ни один beginMenu() не подтвердил вход (enterMenu() == false).
+  //Полная сборка (Build) и действия виджетов (Set) страницу не меняют: после sett.reload()
+  //вебморда остаётся на той же странице, поэтому writeMode не сбрасывается на каждом чтении метки.
+  if (menuAction) {
+    uint8_t page = enteredWrite ? PAGE_WRITE : (enteredSettings ? PAGE_SETTINGS : PAGE_MAIN);
+    if (page != activePage) {
+      resetWriteState();  //переход страницы отменяет ожидание метки (D16)
+      activePage = page;
+      writeMode = (page == PAGE_WRITE);
+      if (page == PAGE_WRITE) {
+        logger.println("Режим записи: активация катушки заблокирована");
+        //Список катушек тянем при входе в меню записи, затем перерисовываем страницу:
+        //опции Select попадают в вебморду только пакетом сборки (reload без force меню не закрывает)
+        fetchSpoolList((bool)db[web::f_notag]);
+        sett.reload();
+      } else if (page == PAGE_SETTINGS) {
+        logger.println("Режим настроек: активация катушки разрешена");
+      } else {
+        logger.println("Главная страница: активация катушки разрешена");
+      }
     }
-    if (b.Input(web::serverMoonraker, "IP:Port Moonraker(Принтер)")) {
-      logger.println("Set IP:Port Moonraker(Принтер):" + String(db[web::serverMoonraker]));
-      db.update();
-    }
-    if (b.Switch(web::sw_mmu, "Устанавливать в MMU (Happy Hare)", &mmu)) {
-      db[web::sw_mmu] = mmu;
-      db.update();
-    }
-    if (b.Button(web::apply1, "Save & Restart")) {
-      db.update();
-      LittleFS.end();
-      delay(100);
-      ESP.restart();
-    }
-    if (b.Button(web::apply2, "Проверка статуса серверов")) {
-      fl_status = true;
-    }
-    b.LED(web::led_mn, "Статус Moonraker", LED_MN, sets::Colors::Yellow, sets::Colors::Green);
-    b.LED(web::led_sp, "Статус Spoolman", LED_SP, sets::Colors::Yellow, sets::Colors::Green);
-    b.LED(web::led_nfc, "NFC считыватель", LED_NFC, sets::Colors::Yellow, sets::Colors::Green);
-  }
-  {
-    sets::Group g(b, "Текущая катушка установленная в SpoolMan");
-    b.Label(web::id, "ID:");
-    b.Label(web::filament, "Имя:");
-  }
-  {
-    sets::Group g(b, "NFC Метка");
-    b.Label(web::nfc_id, "ID:");
-    b.Label(web::nfc_name, "Имя:");
-    b.Label(web::nfc_brand, "Производитель:");
-  }
-  {
-    sets::Group g(b, "Логгер");
-    b.Log(H(log), logger);
   }
 }
 
@@ -235,10 +274,10 @@ void setup() {
   db.init(web::nfc_name, "");
   db.init(web::nfc_brand, "");
   db.init(web::nfc_color, "");
+  db.init(web::nfc_uid, "");
   db.init(web::id, 0);
   db.init(web::filament, "");
-  //Ключи подменю «Записать метку» (v1.3 Task 2)
-  db.init(web::tab, 0);
+  //Ключи подменю «Записать метку» (v1.3 Task 2, меню с v1.3.1)
   db.init(web::spool_sel, 0);
   db.init(web::spool_ids, "");
   db.init(web::spool_opts, "");
@@ -254,10 +293,11 @@ void setup() {
   db[web::nfc_name] = "";
   db[web::nfc_brand] = "";
   db[web::nfc_color] = "";
+  db[web::nfc_uid] = "";
   db[web::id] = 0;
   db[web::filament] = "";
   //Режим записи не переживает перезагрузку: иначе блокировка активации «залипнет»
-  db[web::tab] = 0;
+  activePage = PAGE_MAIN;
   db[web::spool_sel] = 0;
   db[web::f_notag] = false;
   db[web::spool_ids] = "";
@@ -358,8 +398,8 @@ void loop() {
     }
   }
 
-  //Режим записи — производное от активного таба (0 — настройки, 1 — записать метку)
-  writeMode = ((int)db[web::tab] == 1);
+  //Режим записи — производное от открытой страницы (D18: меню «Записать метку»)
+  writeMode = (activePage == PAGE_WRITE);
 
   readNFC();
 
@@ -922,6 +962,9 @@ void readNFC() {
     return;
   }
 
+  //UID прочитанной метки — на главную страницу (D18), независимо от того, разобралось ли содержимое
+  db[web::nfc_uid] = uid;
+
   if (parsed) {
     db[web::nfc_id] = tagID > 0 ? tagID : 0;
     db[web::nfc_name] = doc["type"] | "";
@@ -968,9 +1011,70 @@ void readNFC() {
 
 //=== Режим записи: список катушек для Select ===
 
-//GET /api/v1/spool?allow_archived=false -> опции «{id} — {filament.name}» через ';' в spool_opts
-//и параллельный csv id в spool_ids: b.Select отдаёт индекс опции, а не id катушки (Review Focus 3).
-//noTagOnly — только катушки без tags. Больше N_OPT_MAX опций — усечение + лог (Q8).
+//D19: группировка списка по материалу. HTML-элемент optgroup фронтенд библиотеки не знает
+//(строки «optgroup» в script нет), поэтому — псевдогруппировка: сортируем катушки по материалу,
+//и подпись каждой опции начинается с материала: «материал · бренд · цвет · ID».
+//Разделители опций Select — ';' и перевод строки, поэтому в подписи они недопустимы;
+//'[' и ']' не ставим тоже: у Select есть документированный синтаксис групп «[заголовок]опции»,
+//и случайная скобка переключила бы разбор опций, разъехавшись с параллельным массивом id.
+static String spoolTextPart(const char* raw) {
+  String s = raw ? raw : "";
+  char* p = s.begin();
+  for (unsigned int i = 0; i < s.length(); i++) {
+    switch (p[i]) {
+      case ';': p[i] = ','; break;
+      case '\n':
+      case '\r': p[i] = ' '; break;
+      case '[': p[i] = '('; break;
+      case ']': p[i] = ')'; break;
+    }
+  }
+  s.trim();
+  return s;
+}
+
+static const char* spoolMaterial(JsonObjectConst sp) {
+  const char* m = sp["filament"]["material"] | "";
+  return m ? m : "";
+}
+
+static int spoolId(JsonObjectConst sp) {
+  return sp["id"] | -1;
+}
+
+//Порядок D19: по материалу (без учёта регистра), при равном материале — по id (стабильность)
+static bool spoolBefore(JsonObjectConst a, JsonObjectConst b) {
+  int cmp = strcasecmp(spoolMaterial(a), spoolMaterial(b));
+  if (cmp != 0) return cmp < 0;
+  return spoolId(a) < spoolId(b);
+}
+
+//Подпись опции: «материал · бренд · цвет · ID»; пустые части опускаем, ID показываем всегда
+static String spoolOptionLabel(JsonObjectConst sp) {
+  const char* parts[] = {
+    sp["filament"]["material"] | "",
+    sp["filament"]["vendor"]["name"] | "",
+    sp["filament"]["color_hex"] | "",
+  };
+  String label;
+  for (const char* raw : parts) {
+    String part = spoolTextPart(raw);
+    if (!part.length()) continue;
+    if (label.length()) label += " · ";
+    label += part;
+  }
+  if (label.length()) label += " · ";
+  label += "ID:";
+  label += String(spoolId(sp));
+  //'~' в начале опции фронтенд трактует как «скрыть, сохранив индекс»: опция пропала бы из списка
+  if (label.length() && label.charAt(0) == '~') label.setCharAt(0, '-');
+  return label;
+}
+
+//GET /api/v1/spool?allow_archived=false -> отсортированные по материалу опции «материал · бренд ·
+//цвет · ID» через ';' в spool_opts и параллельный csv id в spool_ids: b.Select отдаёт индекс
+//опции, а не id катушки (Review Focus 3). noTagOnly — только катушки без tags.
+//Больше N_OPT_MAX катушек — берём первые N_OPT_MAX (порядок ответа API) и логируем усечение (Q8).
 bool fetchSpoolList(bool noTagOnly) {
   db[web::spool_opts] = "";
   db[web::spool_ids] = "";
@@ -1001,7 +1105,9 @@ bool fetchSpoolList(bool noTagOnly) {
   //Ответ на проде ~54 КБ — в JsonDocument целиком не влезает: читаем поток с фильтром нужных полей
   JsonDocument filter;
   filter[0]["id"] = true;
-  filter[0]["filament"]["name"] = true;
+  filter[0]["filament"]["material"] = true;
+  filter[0]["filament"]["vendor"]["name"] = true;
+  filter[0]["filament"]["color_hex"] = true;
   filter[0]["tags"] = true;
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
@@ -1014,28 +1120,38 @@ bool fetchSpoolList(bool noTagOnly) {
     return false;
   }
 
-  String opts, ids;
-  int matched = 0, cnt = 0;
+  //Собираем только валидные катушки (id > 0), сортируем по материалу и лишь затем строим опции:
+  //сортировать готовые String-опции дороже по памяти, а JsonObject в массиве — это 2 указателя.
+  static JsonObject rows[N_OPT_MAX];
+  int cnt = 0, matched = 0;
   for (JsonObject sp : doc.as<JsonArray>()) {
     //Фильтр «только без метки»: у катушки нет ни одной привязанной метки
     if (noTagOnly && sp["tags"].size() > 0) continue;
+    if (spoolId(sp) <= 0) continue;
     matched++;
     if (cnt >= N_OPT_MAX) continue;  //дальше только считаем, чтобы залогировать усечение
+    rows[cnt++] = sp;
+  }
 
-    int spoolID = sp["id"] | -1;
-    if (spoolID <= 0) continue;
-    String name = sp["filament"]["name"] | "";
-    //';' и перевод строки — разделители опций Select: подменяем в имени, иначе список «съедет»
-    name.replace(';', ',');
-    name.replace('\n', ' ');
+  //Сортировка вставками: список короткий (десятки), массивы фиксированные — без heap-аллокаций
+  for (int i = 1; i < cnt; i++) {
+    JsonObject cur = rows[i];
+    int j = i - 1;
+    while (j >= 0 && spoolBefore(cur, rows[j])) {
+      rows[j + 1] = rows[j];
+      --j;
+    }
+    rows[j + 1] = cur;
+  }
 
-    if (cnt) {
+  String opts, ids;
+  for (int i = 0; i < cnt; i++) {
+    if (i) {
       opts += ';';
       ids += ',';
     }
-    opts += String(spoolID) + " — " + name;
-    ids += String(spoolID);
-    cnt++;
+    opts += spoolOptionLabel(rows[i]);
+    ids += String(spoolId(rows[i]));
   }
 
   db[web::spool_opts] = opts;
