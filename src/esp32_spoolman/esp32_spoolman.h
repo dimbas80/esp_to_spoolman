@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.2"
+#define VER "1.3.3"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
@@ -29,7 +29,7 @@
 #define BLUE  0x0000FF
 #define GREEN 0x00FF00
 #define YELLOW 0xFFFF00
-#define LIME  0x64FF00  // 100, 255, 0
+#define PURPLE 0x8B00FF //D31: успешная установка катушки (вместо прежнего лимонного цвета)
 
 #include <MFRC522v2.h>
 #include <MFRC522DriverSPI.h>
@@ -80,8 +80,16 @@ DB_KEYS(
   w_uid,
   w_type,
   w_brand,
+  w_color,    //D28: color_hex метки в поле считывателя (для LED-сватча в меню записи)
+  led_tag,    //D28: LED-сватч цвета метки на главной (кружок; updateColor красит кружок)
+  led_tag_w,  //D28: тот же сватч в меню «Записать метку» (id обязан быть уникальным)
   btn_write,
-  btn_erase
+  btn_erase,
+  //D30: слоты MMU Gate (Label на главной): «ID 12 · PETG+ Чёрный» либо «пусто»
+  gate0,
+  gate1,
+  gate2,
+  gate3
 );
 
 extern bool LED_SP;
@@ -129,8 +137,12 @@ extern TimerMs T_LED_WIFI;
 extern TimerMs ResetLED;
 extern TimerMs WatchdogNFC;
 extern TimerMs T_LED_WRITE;  //мигание «ждём метку» (250 мс, D16)
+extern TimerMs T_GATES;      //D30: период опроса слотов MMU Gate (список в 1000 катушек — не каждый цикл)
 
 #define RETRY_DELAY 30000  //Пауза между повторными попытками HTTP (мс)
+//D31: срок свечения результата NFC-операции (чтение/запись/стирание) и период мигания ошибки
+#define LED_EFFECT_MS 2000
+#define LED_BLINK_MS  250
 
 //Объявления функций
 void build(sets::Builder& b);

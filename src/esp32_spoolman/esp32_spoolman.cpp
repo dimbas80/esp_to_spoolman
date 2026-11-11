@@ -1,6 +1,7 @@
 // esp32_spoolman.cpp — все глобальные переменные и тела функций
 #include "esp32_spoolman.h"
 #include "spool_format.h"  //D24: палитра имён цветов и санитизация подписи опции (host-тестируемо)
+#include "card_uids.h"     //D29: кодек spool.extra["card_uids"] (host-тестируемо)
 #include <Adafruit_NeoPixel.h>
 
 //Управление WS2812 через NeoPixel (62% flash, 2MB partition — хватает)
@@ -38,7 +39,11 @@ uint32_t lastUID = 0;
 WriteState wstate = IDLE;
 bool erasePending = false;  //D9: ожидание по кнопке «Стереть метку» (false — запись, T3)
 unsigned long writeStart = 0;
-unsigned long ledHoldUntil = 0;  //до этого момента статусный updateLED() не затирает цвет результата записи
+//D31: разовый эффект светодиода после NFC-операции (2 с свечения либо мигания) —
+//в это время статусный updateLED() не трогает цвет; подробности — в ledEffect()/ledEffectTick()
+bool ledFxBlink = false;
+bool ledFxOn = true;
+uint32_t ledFxColor = 0;
 String conflictUID = "";  //D13: UID, по которому уже сообщили владельца (повтор = перелинковка)
 int conflictSpool = 0;    //D13: спул-владелец UID из 409
 unsigned long lastSpoolmanFail = 0;
@@ -65,6 +70,12 @@ TimerMs T_LED_WIFI(500, 1, 0);
 TimerMs ResetLED(1000, 1, 0);
 TimerMs WatchdogNFC(30000, 1, 0);
 TimerMs T_LED_WRITE(250, 1, 0);
+//D31: срок эффекта светодиода (2 с) — режим таймера: после срабатывания останавливается сам
+TimerMs T_LED_FX(LED_EFFECT_MS, 0, 1);
+//D31: период мигания ошибки — как у ожидания метки (T_LED_WRITE)
+TimerMs T_LED_BLINK(LED_BLINK_MS, 1, 0);
+//D30: слоты Gate опрашиваются списком катушек (limit=1000), поэтому реже цикла индикаторов (500 мс)
+TimerMs T_GATES(10000, 1, 0);
 
 //Сброс write-состояния: вызывается на ЛЮБОЙ переход таба (Review Focus 4),
 //чтобы выход из подменю не оставлял активного ожидания метки.
@@ -73,12 +84,37 @@ static void resetWriteState() {
   db[web::w_uid] = "";
   db[web::w_type] = "";
   db[web::w_brand] = "";
+  db[web::w_color] = "";  //D28: сватч цвета в меню записи гаснет вместе с полями метки
   lastUID = 0;  //метка, прочитанная до входа в режим, должна читаться заново
   //Выход из подменю отменяет ожидание метки немедленно (D16), конфликт 409 тоже сбрасывается
   wstate = IDLE;
   erasePending = false;
   conflictUID = "";
   conflictSpool = 0;
+}
+
+//=== D28: цвет метки — LED-сватч (кружок) + подпись именем цвета ===
+//Label.updateColor красит ТОЛЬКО текст значения (span.style.color), не полосу, поэтому цвет
+//катушки показываем LED-виджетом: у него updateColor перекрашивает сам кружок (--color).
+//Нейтральный серый — когда цвета нет (метка пуста / color_hex не разобран): сватч не врёт.
+#define LED_SWATCH_OFF 0x303030
+
+//Spoolman color_hex -> uint32 0xRRGGBB для сватча; has=false — hex не разобран.
+static uint32_t swatchColor(const char* hex, bool& has) {
+  uint8_t r, g, b;
+  has = spoolfmt::parseHexColor(hex, r, g, b);
+  if (!has) return LED_SWATCH_OFF;
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+//Подпись сватча: имя ближайшего цвета палитры v1.3.2; hex не разобран — показываем сам hex
+//(подпись не врёт молчанием), пусто — «—».
+static String swatchLabel(const char* hex) {
+  String label = "Цвет: ";
+  if (!hex || !*hex) return label + "—";
+  const char* name = spoolfmt::colorNameForHex(hex);
+  label += name ? name : String(hex);
+  return label;
 }
 
 //Интерфейс (D18, порядок — D26): корень build() — два подменю («Записать метку», «Настройки») и
@@ -114,6 +150,12 @@ void build(sets::Builder& b) {
       b.Label(web::w_uid, "UID:");
       b.Label(web::w_type, "Материал:");
       b.Label(web::w_brand, "Производитель:");
+      //D28: цвет метки — сватч-кружок + имя цвета (в меню записи своего id: дубли id фронтенд не
+      //принимает). Значение LED — «есть ли цвет»: пустая метка показывает нейтральный серый.
+      String wColorHex = db[web::w_color];
+      bool wHasColor = false;
+      uint32_t wSwatch = swatchColor(wColorHex.c_str(), wHasColor);
+      b.LED(web::led_tag_w, swatchLabel(wColorHex.c_str()), wHasColor, wSwatch, wSwatch);
     }
     {
       sets::Group g(b, "Действия");
@@ -211,13 +253,27 @@ void build(sets::Builder& b) {
     b.Label(web::id, "ID:");
     b.Label(web::filament, "Имя:");
   }
+  //D30: слоты MMU видны ТОЛЬКО при включённом «Устанавливать в MMU» (sw_mmu); значения
+  //Gate0..Gate3 заполняет updateMmuGates() на цикле проверки серверов.
+  if (mmu) {
+    sets::Group g(b, "MMU Gate");
+    b.Label(web::gate0, "Gate0:");
+    b.Label(web::gate1, "Gate1:");
+    b.Label(web::gate2, "Gate2:");
+    b.Label(web::gate3, "Gate3:");
+  }
   {
     sets::Group g(b, "NFC Метка");
     b.Label(web::nfc_id, "ID:");
     b.Label(web::nfc_uid, "UID:");
     b.Label(web::nfc_name, "Материал:");
     b.Label(web::nfc_brand, "Производитель:");
-    b.Label(web::nfc_color, "Цвет:");
+    //D28: вместо hex-строки — сватч + имя цвета из палитры v1.3.2 (окраска — upd.updateColor
+    //при чтении метки, при пересборке страницы цвет приходит из colorOn/colorOff)
+    String colorHex = db[web::nfc_color];
+    bool hasColor = false;
+    uint32_t swatch = swatchColor(colorHex.c_str(), hasColor);
+    b.LED(web::led_tag, swatchLabel(colorHex.c_str()), hasColor, swatch, swatch);
   }
   {
     sets::Group g(b, "Логгер");
@@ -253,6 +309,36 @@ void build(sets::Builder& b) {
 void update(sets::Updater& upd) {
   upd.update(H(log), logger);
   upd.update(H(log_w), logger);  //копия логгера в меню записи
+
+  //D28: сватч цвета метки — updateColor красит кружок (Label.updateColor красил бы только текст).
+  //Шлём только при смене цвета: подпись (имя цвета) приходит с пересборкой страницы, которую
+  //делает readNFC (sett.reload после касания).
+  static String lastMainColor, lastWriteColor;
+  String mainColor = db[web::nfc_color];
+  if (mainColor != lastMainColor) {
+    lastMainColor = mainColor;
+    bool has = false;
+    upd.updateColor(H(led_tag), swatchColor(mainColor.c_str(), has));
+  }
+  String writeColor = db[web::w_color];
+  if (writeColor != lastWriteColor) {
+    lastWriteColor = writeColor;
+    bool has = false;
+    upd.updateColor(H(led_tag_w), swatchColor(writeColor.c_str(), has));
+  }
+
+  //D30: слоты Gate обновляются тем же каналом и в том же цикле, что и индикаторы серверов;
+  //шлём только изменившиеся слоты (опрос — раз в T_GATES, лишний трафик каждую секунду не нужен)
+  if (mmu) {
+    static String lastGates[4] = { "", "", "", "" };
+    const size_t gateIds[4] = { H(gate0), H(gate1), H(gate2), H(gate3) };
+    const String gateTexts[4] = { String(db[web::gate0]), String(db[web::gate1]), String(db[web::gate2]), String(db[web::gate3]) };
+    for (int i = 0; i < 4; i++) {
+      if (gateTexts[i] == lastGates[i]) continue;
+      lastGates[i] = gateTexts[i];
+      upd.update(gateIds[i], gateTexts[i]);
+    }
+  }
 }
 
 //Обновление светодиода по текущему состоянию
@@ -274,6 +360,10 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Версия " VER);
   logger.println("Версия " VER);
+  //D27: причина перезагрузки — единственный след «зависания, вылеченного reboot'ом»
+  //(power-on, panic, watchdog, brownout, software reset и т.д. — числовой код esp_reset_reason())
+  Serial.println("Boot reason: " + String(esp_reset_reason()));
+  logger.println("Boot reason: " + String(esp_reset_reason()));
   strip.begin();
   strip.setBrightness(50);
   strip.clear();
@@ -282,6 +372,9 @@ void setup() {
   ResetLED.setPeriodMode();
   WatchdogNFC.setPeriodMode();
   T_LED_WRITE.setPeriodMode();
+  T_LED_FX.setTimerMode();    //D31: эффект — разовый (2 с), сам себя останавливает
+  T_LED_BLINK.setPeriodMode();  //D31: мигание ошибки
+  T_GATES.setPeriodMode();      //D30: опрос слотов MMU Gate
   set_led_color(0);  //гасим светодиод
 
   WiFi.mode(WIFI_AP_STA);
@@ -314,6 +407,12 @@ void setup() {
   db.init(web::w_uid, "");
   db.init(web::w_type, "");
   db.init(web::w_brand, "");
+  db.init(web::w_color, "");  //D28: цвет метки в поле считывателя (сватч в меню записи)
+  //D30: слоты MMU Gate по умолчанию пусты (иначе Label прочитал бы мусор прошлой прошивки)
+  db.init(web::gate0, "пусто");
+  db.init(web::gate1, "пусто");
+  db.init(web::gate2, "пусто");
+  db.init(web::gate3, "пусто");
   db.init(web::btn_write, 0);
   db.init(web::btn_erase, 0);
   mmu = db[web::sw_mmu]; 
@@ -334,6 +433,12 @@ void setup() {
   db[web::w_uid] = "";
   db[web::w_type] = "";
   db[web::w_brand] = "";
+  db[web::w_color] = "";  //D28: сватч меню записи стартует без цвета
+  //D30: до первого опроса слотов — «пусто» (раздел виден только при включённом MMU)
+  db[web::gate0] = "пусто";
+  db[web::gate1] = "пусто";
+  db[web::gate2] = "пусто";
+  db[web::gate3] = "пусто";
   writeMode = false;
 
   pinMode(SW_WIFI, INPUT_PULLUP);
@@ -395,15 +500,24 @@ void setup() {
   logReaderGain("после самотеста (boot)", true);  //D22: фактический RxGain после PCD_Reset внутри самотеста
 }
 
+//D30: слоты Gate0..Gate3 из extra.mmu_gate_map (определение — в секции «MMU Gate» ниже)
+static void updateMmuGates();
+//D31: тик эффекта светодиода (определение — в секции «D31» ниже)
+static bool ledEffectTick();
+
 void loop() {
   sett.tick();
   T_LED_WIFI.tick();
   ResetLED.tick();
   WatchdogNFC.tick();
+  T_GATES.tick();
 
   if (T_LED_WIFI.ready() && WiFi.status() == WL_CONNECTED) {
     statusServer();
     curent_filament_name(curentID);
+    //D30: слоты MMU Gate — в том же цикле проверки серверов; свой 10-секундный период, потому
+    //что это GET списка катушек (limit=1000), а цикл индикаторов — 500 мс (D30, см. T_GATES)
+    if (T_GATES.ready()) updateMmuGates();
   }
 
   if (ResetLED.ready()) {
@@ -434,10 +548,10 @@ void loop() {
 
   readNFC();
 
-  //LED: ожидание метки (мигание жёлтым) имеет приоритет над статусным обновлением (D16);
-  //результат записи (LIME/RED) держится ~1.5 с, иначе статусный цвет затирал бы его сразу же
+  //LED: ожидание метки (мигание жёлтым) имеет приоритет над статусным обновлением (D16), затем —
+  //результат NFC-операции (2 с, D31), и только потом статусный цвет updateLED()
   if (!writeTick()) {
-    if ((int32_t)(millis() - ledHoldUntil) >= 0) updateLED();
+    if (!ledEffectTick()) updateLED();
   }
 
   //Читаем Serial
@@ -461,6 +575,42 @@ void loop() {
 void set_led_color(uint32_t color) {
   ws2812_send(color);
   fl_led = true;
+}
+
+//=== D31: семантика светодиода NFC-операций ===
+//Чтение/запись/стирание показывают РЕЗУЛЬТАТ операции 2 с, затем возвращается статусный цвет
+//updateLED() (сеть, Moonraker, Spoolman — без изменений):
+//  успешное чтение метки            -> YELLOW 2 с
+//  ошибка чтения (в т.ч. пустая)    -> мигание RED 2 с
+//  успешная запись/стирание         -> PURPLE 2 с
+//  ошибка записи/стирания           -> мигание RED 2 с
+//Приоритеты в loop(): ожидание метки (writeTick, D16) -> эффект NFC (эта пара) -> updateLED().
+//Срок эффекта — таймер T_LED_FX (2 с, режим таймера), мигание — T_LED_BLINK (250 мс).
+static void ledEffect(uint32_t color, bool blink) {
+  ledFxColor = color;
+  ledFxBlink = blink;
+  ledFxOn = true;
+  set_led_color(color);
+  T_LED_BLINK.ready();  //сброс возможного непрочитанного флага прошлого эффекта (старт мигания с свечения)
+  T_LED_FX.restart();
+  T_LED_BLINK.restart();
+}
+
+//true — LED в этом проходе loop() ведёт эффект NFC-операции, статусный цвет трогать нельзя.
+static bool ledEffectTick() {
+  T_LED_FX.tick();
+  T_LED_BLINK.tick();
+  if (!T_LED_FX.active()) return false;  //эффект истёк (или не запускался) — дальше статусный цвет
+  if (ledFxBlink && T_LED_BLINK.ready()) {
+    ledFxOn = !ledFxOn;
+    set_led_color(ledFxOn ? ledFxColor : 0);
+  }
+  return true;
+}
+
+//D31: результат записи/стирания метки: успех — PURPLE 2 с, ошибка — мигание RED 2 с.
+static void setWriteResult(bool ok) {
+  ledEffect(ok ? PURPLE : RED, !ok);
 }
 
 void errorServer(String error) {
@@ -667,7 +817,7 @@ void SetSpool(int SetID) {
         Serial.println("Катушка с ID:" + String(SetID) + " успешно установлена");
         logger.println("Катушка с ID:" + String(SetID) + " успешно установлена");
         curent_filament_name(curentID);
-        set_led_color(LIME);
+        set_led_color(PURPLE);  //D31: успешная установка — PURPLE (лимонный цвет отменён)
       } else {
         Serial.println("Ошибка установки катушки с ID: " + String(SetID));
         logger.println(sets::Logger::error() + "Ошибка установки катушки с ID: " + String(SetID));
@@ -696,7 +846,7 @@ void mmu_next_spoolid(int SetID) {
       if (httpResponseCode > 0) {
         Serial.println("Установка катушки с ID в MMU: " + String(SetID));
         logger.println("Установка катушки с ID в MMU: " + String(SetID));
-        set_led_color(LIME);
+        set_led_color(PURPLE);  //D31: успешная установка в MMU — PURPLE (лимонный цвет отменён)
       } else {
         Serial.println("Ошибка установки катушки с ID в MMU: " + String(SetID));
         logger.println(sets::Logger::error() + "Ошибка установки катушки с ID в MMU: " + String(SetID));
@@ -997,8 +1147,6 @@ static int tagSpoolID(JsonDocument& doc) {
 
 //Машина записи по касанию метки в WAIT_TAG (определение — в секции «Запись метки v1.3» в конце файла)
 static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocument& tagDoc, bool parsed);
-//Цвет результата записи/стирания (определение — в секции «Запись метки v1.3»)
-static void setWriteResult(uint32_t color);
 
 void readNFC() {
   if (!mfrc522.PICC_IsNewCardPresent()) {
@@ -1037,6 +1185,7 @@ void readNFC() {
     db[web::w_uid] = uid;
     db[web::w_type] = doc["type"] | "";
     db[web::w_brand] = doc["brand"] | "";
+    db[web::w_color] = doc["color_hex"] | "";  //D28: цвет для сватча в меню записи
     Serial.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | "") + " (активация заблокирована)");
     logger.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
 
@@ -1047,11 +1196,16 @@ void readNFC() {
       erasePending = false;
       wstate = doErase ? ERASING : WRITING;
       if (doErase) {
-        setWriteResult(eraseTag() ? LIME : RED);
+        setWriteResult(eraseTag());
       } else {
         tagWriteFlow(uid, payload, doc, parsed);
       }
       wstate = IDLE;
+    } else {
+      //D31: в меню записи светодиод ведёт себя так же, как на главной (раньше не светился вовсе):
+      //распознанная метка — YELLOW 2 с, пустая/нераспознанная — мигание RED 2 с (D20-лог выше)
+      if (parsed) ledEffect(YELLOW, false);
+      else ledEffect(RED, true);
     }
 
     mfrc522.PICC_HaltA();
@@ -1086,16 +1240,19 @@ void readNFC() {
       String why = payload.length() ? " (содержимое не распознано)" : "";
       Serial.println("Метка " + uid + ": метка пустая, UID привязан к spool ID " + String(matched) + ", катушка не установлена" + why);
       logger.println(sets::Logger::warn() + "Метка " + uid + ": метка пустая, UID привязан к spool ID " + String(matched) + ", катушка не установлена" + why);
-      set_led_color(YELLOW);  //D20: жёлтый, не зелёный — катушка не установлена
+      //D31: пустая метка — ошибка чтения в терминах владельца: мигание RED 2 с (D20-лог остаётся)
+      ledEffect(RED, true);
       return;
     }
     Serial.println("Метка привязана к катушке ID:" + String(matched));
     logger.println("Метка " + uid + " привязана к катушке ID:" + String(matched));
-    set_led_color(YELLOW);
     SetSpool(matched);
     if (mmu == true) {
       mmu_next_spoolid(matched);
     }
+    //D31: результат чтения — YELLOW 2 с (после установки: успешная установка красит PURPLE,
+    //но для владельца исход операции — «метка прочитана»)
+    ledEffect(YELLOW, false);
     return;
   }
 
@@ -1103,11 +1260,11 @@ void readNFC() {
   if (tagID > 0) {
     Serial.println("Установка катушки по содержимому метки ID:" + String(tagID));
     logger.println("Установка катушки по содержимому метки ID:" + String(tagID));
-    set_led_color(YELLOW);
     SetSpool(tagID);
     if (mmu == true) {
       mmu_next_spoolid(tagID);
     }
+    ledEffect(YELLOW, false);  //D31: метка прочитана
     return;
   }
 
@@ -1115,7 +1272,7 @@ void readNFC() {
   Serial.print("Метка не распознана, payload: ");
   Serial.println(payload);
   logger.println(sets::Logger::error() + "Метка " + uid + " не распознана (нет линковки и NDEF-формата)");
-  set_led_color(RED);
+  ledEffect(RED, true);  //D31: ошибка чтения — мигание RED 2 с
 }
 
 //=== Режим записи: список катушек для Select ===
@@ -1317,6 +1474,108 @@ int selectedSpoolID() {
     cur++;
   }
   return -1;
+}
+
+//=== D30: MMU Gate — Gate0..Gate3 из extra.mmu_gate_map (только при включённом MMU) ===
+
+//Значение extra-поля как текст: Spoolman хранит extra словарём строк, но числовые поля
+//(mmu_gate_map) в ответе бывают и числом — приводим к строке, не теряя значение.
+static String extraText(JsonVariantConst v) {
+  if (v.is<const char*>()) return String(v.as<const char*>());
+  if (v.is<int>()) return String(v.as<int>());
+  if (v.is<bool>()) return v.as<bool>() ? "1" : "0";
+  return "";
+}
+
+//Подпись слота: «ID 12 · PETG+ Чёрный». Имя — filament.name, как в разделе «Текущая катушка»
+//(на проде это «PETG чёрный», «PLA зелёный светящийся»). Если имени нет — собираем из материала
+//и имени цвета палитры v1.3.2. Без хвоста остаётся «ID 12».
+static String gateText(JsonObjectConst sp) {
+  String text = "ID " + String(spoolId(sp));
+  String name = sp["filament"]["name"] | "";
+  name.trim();
+  if (!name.length()) {
+    String tail = sp["filament"]["material"] | "";
+    tail.trim();
+    const char* colorHex = sp["filament"]["color_hex"] | "";
+    const char* colorName = spoolfmt::colorNameForHex(colorHex);
+    if (colorName && *colorName) {
+      if (tail.length()) tail += ' ';
+      tail += colorName;
+    }
+    name = tail;
+  }
+  if (name.length()) {
+    text += " · ";
+    text += name;
+  }
+  return text;
+}
+
+//GET /api/v1/spool?limit=1000: катушки с extra.mmu_gate_map = "0".."3" раскладываются по слотам,
+//остальные слоты — «пусто». Поле приходит JSON-строкой («-1» по умолчанию), поэтому сравнение —
+//по нормализованному String, а не числом. Два спула на один gate: побеждает первый в ответе API
+//(в лог — предупреждение). Вызывается с цикла проверки серверов, период — T_GATES.
+static void updateMmuGates() {
+  if (!mmu) return;  //D30: раздел Gate живёт только при включённом «Устанавливать в MMU»
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastSpoolmanFail < RETRY_DELAY) return;
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?limit=1000";
+  http.begin(url);
+  http.setTimeout(2000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.println("MMU Gate: список катушек -> HTTP " + String(code));
+    logger.println(sets::Logger::warn() + "MMU Gate: список катушек не получен (HTTP " + String(code) + ")");
+    if (code <= 0) lastSpoolmanFail = millis();
+    return;
+  }
+
+  //Список идёт потоком с фильтром нужных полей (как список катушек для Select): целиком он
+  //в JsonDocument не влезает
+  JsonDocument filter;
+  filter[0]["id"] = true;
+  filter[0]["filament"]["name"] = true;  //подпись слота — имя филамента, как на главной
+  filter[0]["filament"]["material"] = true;
+  filter[0]["filament"]["color_hex"] = true;
+  filter[0]["extra"]["mmu_gate_map"] = true;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    Serial.println("MMU Gate: ошибка разбора " + String(error.c_str()));
+    logger.println(sets::Logger::warn() + "MMU Gate: ответ не разобран (" + String(error.c_str()) + ")");
+    return;
+  }
+
+  String slot[4] = { "пусто", "пусто", "пусто", "пусто" };
+  bool taken[4] = { false, false, false, false };
+  int conflicts = 0;
+  for (JsonObject sp : doc.as<JsonArray>()) {
+    String gate = extraText(sp["extra"]["mmu_gate_map"]);
+    gate.trim();
+    //Слот — ровно один символ '0'..'3': «-1» (не назначено), пусто и «10» не слоты
+    if (gate.length() != 1 || gate[0] < '0' || gate[0] > '3') continue;
+    int idx = gate[0] - '0';
+    if (taken[idx]) {
+      conflicts++;
+      continue;
+    }
+    taken[idx] = true;
+    slot[idx] = gateText(sp);
+  }
+
+  db[web::gate0] = slot[0];
+  db[web::gate1] = slot[1];
+  db[web::gate2] = slot[2];
+  db[web::gate3] = slot[3];
+  if (conflicts) {
+    logger.println(sets::Logger::warn() + "MMU Gate: у " + String(conflicts) + " катушек gate занят другой катушкой — показана первая в ответе");
+  }
 }
 
 //=== Запись метки v1.3: lock-проверка, NDEF-запись, линковка (D5–D9, D13–D16) ===
@@ -1880,13 +2139,88 @@ static int tagPayloadFormat(JsonDocument& doc, bool parsed) {
   return 0;
 }
 
-//Цвет результата записи (LIME/RED) держится ~1.5 с: иначе статусный updateLED() в том же
-//проходе loop() сразу затрёт его (см. ledHoldUntil в loop()).
-#define LED_HOLD_MS 1500
+//Цвет результата записи/стирания — эффект D31 (setWriteResult: PURPLE 2 с / мигание RED 2 с).
+//Определение — в секции «D31: семантика светодиода NFC-операций» выше.
 
-static void setWriteResult(uint32_t color) {
-  set_led_color(color);
-  ledHoldUntil = millis() + LED_HOLD_MS;
+//=== D29: card_uids в spool.extra (формат SpoolPainter) ===
+
+//GET /api/v1/spool/{id} -> PATCH /api/v1/spool/{id} {"extra": {...}} с мержем extra.
+//add=true — дописать UID в card_uids (без дублей), false — убрать (стирание/отвязка).
+//Формат значения — как у SpoolPainter: кавычки ВНУТРИ значения, hex верхним регистром
+//(кодек — card_uids.h, host-тест workflows/<task>/host-tests/test_card_uids.cpp).
+//Любая ошибка (сеть/HTTP/формат) — только Serial+логгер: линковка UID в Spoolman и запись
+//метки от этого не зависят (D29) и не прерываются.
+static bool cardUidsUpdate(int spoolID, const String& uid, bool add) {
+  if (spoolID <= 0 || !uid.length()) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("card_uids: нет WiFi (катушка ID:" + String(spoolID) + ", UID " + uid + ")");
+    return false;
+  }
+
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool/" + String(spoolID);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  //Фильтр: чужие поля катушки не нужны — PATCH всё равно шлём мержем только extra
+  JsonDocument filter;
+  filter["extra"] = true;
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.println("card_uids: катушка ID:" + String(spoolID) + " -> HTTP " + String(code));
+    logger.println(sets::Logger::warn() + "card_uids: катушка ID:" + String(spoolID) + " не прочитана (HTTP " + String(code) + "), поле не изменено");
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    Serial.println("card_uids: катушка ID:" + String(spoolID) + ": ошибка разбора " + String(error.c_str()));
+    logger.println(sets::Logger::warn() + "card_uids: катушка ID:" + String(spoolID) + ": ответ не разобран, поле не изменено");
+    return false;
+  }
+
+  String raw = extraText(doc["extra"]["card_uids"]);
+  static char newValue[carduids::kValueMax];  //вне стека loop(): до ~800 байт
+  int st = add ? carduids::add(raw.c_str(), uid.c_str(), newValue, sizeof(newValue))
+               : carduids::drop(raw.c_str(), uid.c_str(), newValue, sizeof(newValue));
+  if (st == carduids::REFUSED) {
+    Serial.println("card_uids: поле катушки ID:" + String(spoolID) + " не разобрано/переполнено — не меняю");
+    logger.println(sets::Logger::warn() + "card_uids: катушка ID:" + String(spoolID) + ": формат поля не позволяет правку, значение оставлено как есть");
+    return false;
+  }
+  if (st == carduids::UNCHANGED) {
+    Serial.println("card_uids: UID " + uid + (add ? " уже в поле" : " отсутствует в поле") + " катушки ID:" + String(spoolID));
+    return true;
+  }
+
+  //PATCH: extra целиком (чужие ключи extra сохраняем как пришли) + новое card_uids
+  JsonDocument patch;
+  JsonObject extra = patch["extra"].to<JsonObject>();
+  for (JsonPairConst kv : doc["extra"].as<JsonObjectConst>()) extra[kv.key()] = kv.value();
+  extra["card_uids"] = newValue;
+  String body;
+  serializeJson(patch, body);
+
+  //Отдельный клиент для PATCH: переиспользование после end() в ESP32-ядре не гарантировано
+  HTTPClient httpPatch;
+  httpPatch.begin(url);
+  httpPatch.setTimeout(1500);
+  httpPatch.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  httpPatch.addHeader("Content-Type", "application/json");
+  int patchCode = httpPatch.PATCH(body);  //в HTTPClient ESP32 PATCH есть отдельным методом
+  httpPatch.end();
+
+  if (patchCode < 200 || patchCode >= 300) {
+    Serial.println("card_uids: PATCH катушки ID:" + String(spoolID) + " -> HTTP " + String(patchCode));
+    logger.println(sets::Logger::warn() + "card_uids: катушка ID:" + String(spoolID) + ": поле не сохранено (HTTP " + String(patchCode) + "), линковка UID не отменена");
+    return false;
+  }
+  Serial.println("card_uids: катушка ID:" + String(spoolID) + " -> " + String(newValue));
+  logger.println("card_uids: катушка ID:" + String(spoolID) + " -> " + String(newValue));
+  return true;
 }
 
 //D8/D13: линковка с двухшаговым подтверждением конфликта. true — UID привязан к spoolID.
@@ -1897,6 +2231,7 @@ static bool linkWithConflict(const String& uid, int spoolID) {
     conflictSpool = 0;
     Serial.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
     logger.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
+    cardUidsUpdate(spoolID, uid, true);  //D29: UID в spool.extra.card_uids (ошибка — только лог)
     return true;
   }
   if (!holder.length()) return false;  //не 409 либо владелец без id — уже залогировано
@@ -1930,6 +2265,9 @@ static bool linkWithConflict(const String& uid, int spoolID) {
   conflictSpool = 0;
   Serial.println("Метка " + uid + " переехала " + String(holderSpool) + "→" + String(spoolID));
   logger.println("метка переехала " + String(holderSpool) + "→" + String(spoolID));
+  //D29: симметрия перелинковки — UID уходит из card_uids старой катушки и появляется у новой
+  cardUidsUpdate(holderSpool, uid, false);
+  cardUidsUpdate(spoolID, uid, true);
   return true;
 }
 
@@ -1940,7 +2278,7 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
   if (spoolID <= 0) {
     Serial.println("Запись метки: катушка не выбрана");
     logger.println(sets::Logger::error() + "Запись метки: катушка не выбрана (обновите список катушек)");
-    setWriteResult(RED);
+    setWriteResult(false);
     return;
   }
   logger.println("Запись метки " + uid + " -> катушка ID:" + String(spoolID));
@@ -1953,14 +2291,14 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
     //«Чип не опознан» — состояние неизвестно: ни записи, ни привязки (D21)
     Serial.println("Запись метки " + uid + ": чип не опознан, запись не выполнена, UID не привязан");
     logger.println(sets::Logger::error() + "Запись метки " + uid + ": чип не опознан — запись не выполнена, UID не привязан (катушка ID:" + String(spoolID) + " не тронута)");
-    setWriteResult(RED);
+    setWriteResult(false);
     return;
   }
   if (lock == TAG_LOCK_LOCKED) {
     //D21: содержимое не записано — значит и UID не линкуем (привязка без записи запрещена)
     Serial.println("Запись метки " + uid + ": метка read-only, запись не выполнена, UID не привязан");
     logger.println(sets::Logger::warn() + "Запись метки " + uid + ": метка read-only — содержимое не записано, UID не привязан к ID:" + String(spoolID));
-    setWriteResult(RED);
+    setWriteResult(false);
     return;  //поля w_* уже отражают фактическое содержимое метки (её не меняли)
   }
 
@@ -1971,7 +2309,7 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
     payloadOut = augmentVendorJSON(tagDoc, spoolID);
     if (!payloadOut.length()) {
       logger.println(sets::Logger::error() + "Запись метки: не удалось пересобрать вендорский JSON");
-      setWriteResult(RED);
+      setWriteResult(false);
       return;
     }
     Serial.println("Вендорская метка: дописан spool_id=" + String(spoolID) + ", ключи сохранены");
@@ -1980,7 +2318,7 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
     String material, brand, colorHex;
     int extruderTemp = 0, bedTemp = 0;
     if (!readSpoolForTag(spoolID, material, brand, colorHex, extruderTemp, bedTemp)) {
-      setWriteResult(RED);
+      setWriteResult(false);
       return;
     }
     payloadOut = buildOpenspoolJSON(spoolID, material, brand, colorHex, extruderTemp, bedTemp);
@@ -1998,7 +2336,7 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
   if (!writeNDEF(payloadOut)) {
     Serial.println("Запись метки " + uid + " не удалась");
     logger.println(sets::Logger::error() + "Запись метки " + uid + " не удалась, причина в логах выше");
-    setWriteResult(RED);
+    setWriteResult(false);
     return;
   }
   Serial.println("Метка " + uid + " записана: " + String(payloadOut.length()) + " байт");
@@ -2014,11 +2352,14 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
     db[web::w_id] = tagID > 0 ? tagID : spoolID;
     db[web::w_type] = post["type"] | "";
     db[web::w_brand] = post["brand"] | "";
+    db[web::w_color] = post["color_hex"] | "";  //D28: сватч меню записи показывает цвет с метки
   } else {
     db[web::w_id] = spoolID;
   }
 
-  setWriteResult(linked ? LIME : RED);
+  //D31: запись удалась и UID привязан — PURPLE 2 с; UID не привязан — мигание RED 2 с
+  //(для владельца операция не завершена, причина уже в логе линковки)
+  setWriteResult(linked);
 }
 
 //=== Стирание метки v1.3: zero-fill + пустой NDEF + отвязка UID (D9/D14) ===
@@ -2201,6 +2542,7 @@ bool eraseTag() {
         Serial.println("Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
         logger.println(sets::Logger::warn() + "Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
       }
+      cardUidsUpdate(owner, uid, false);  //D29: симметрия линковке — UID уходит из card_uids
     } else if (code == 404) {
       //На этой катушке линковки нет: метка могла быть привязана к филаменту
       if (tagLinkedToFilament(uid)) {
@@ -2232,6 +2574,7 @@ bool eraseTag() {
     db[web::w_uid] = "";
     db[web::w_type] = "";
     db[web::w_brand] = "";
+    db[web::w_color] = "";  //D28: сватч меню записи гаснет — цвета на метке больше нет
   }
   return done;
 }
