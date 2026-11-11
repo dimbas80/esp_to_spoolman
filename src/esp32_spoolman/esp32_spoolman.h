@@ -102,6 +102,9 @@ extern bool writeMode;
 //WRITING/ERASING — идёт запись/стирание.
 enum WriteState { IDLE, WAIT_TAG, WRITING, ERASING };
 extern WriteState wstate;
+//Намерение ожидания: false — «Записать метку» (T3), true — «Стереть метку» (D9/D14);
+//кнопка кладёт wstate=WAIT_TAG, а по касанию метки решает, какую машину запускать.
+extern bool erasePending;
 //Таймаут ожидания метки после нажатия кнопки (D16)
 #define WRITE_TAG_TIMEOUT 60000
 //Состояние конфликта 409 (D13): UID, по которому уже сообщили владельца, и спул-владелец.
@@ -150,5 +153,6 @@ bool tagLockCheck(bool& writable);  //lock-биты/CC/PROT до записи; w
 bool writeNDEF(const String& payload);  //CC + TLV + запись по страницам + перечитывание для подтверждения
 bool linkTagUID(const String& uid, int spoolID, String& holderID);  //POST /spool/{id}/tag; 409 -> holderID
 bool unlinkTagUID(const String& uid, int spoolID);                  //DELETE /spool/{id}/tag/{uid} (D13/D9)
+bool eraseTag();                                                    //D9/D14: zero-fill + пустой NDEF + отвязка UID
 bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp);  //GET /spool/{id} для D6
 bool writeTick();  //таймаут ожидания метки + мигание (true — LED ведёт ожидание, updateLED не нужен)

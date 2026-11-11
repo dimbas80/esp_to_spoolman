@@ -34,6 +34,7 @@ bool writeMode = false;  //D10: режим записи — активация �
 uint32_t lastUID = 0;
 //Машина записи (D16): ожидание метки после нажатия кнопки + таймаут 60 с
 WriteState wstate = IDLE;
+bool erasePending = false;  //D9: ожидание по кнопке «Стереть метку» (false — запись, T3)
 unsigned long writeStart = 0;
 unsigned long ledHoldUntil = 0;  //до этого момента статусный updateLED() не затирает цвет результата записи
 String conflictUID = "";  //D13: UID, по которому уже сообщили владельца (повтор = перелинковка)
@@ -58,6 +59,7 @@ static void resetWriteState() {
   lastUID = 0;  //метка, прочитанная до входа в режим, должна читаться заново
   //Выход из подменю отменяет ожидание метки немедленно (D16), конфликт 409 тоже сбрасывается
   wstate = IDLE;
+  erasePending = false;
   conflictUID = "";
   conflictSpool = 0;
 }
@@ -106,6 +108,7 @@ void build(sets::Builder& b) {
           set_led_color(RED);
         } else {
           lastUID = 0;  //метка, уже лежащая на считывателе, должна прочитаться заново
+          erasePending = false;  //намерение: запись (не стирание)
           writeStart = millis();
           wstate = WAIT_TAG;
           T_LED_WRITE.restart();
@@ -113,8 +116,17 @@ void build(sets::Builder& b) {
           logger.println("Запись метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с), катушка ID:" + String(spoolID));
         }
       }
-      //«Стереть метку» — Task 4 (стирание чипа + отвязка UID)
-      b.Button(web::btn_erase, "Стереть метку", sets::Colors::Red);
+      //«Стереть метку» (D9/D14): катушку выбирать не нужно — владелец UID ищется в Spoolman по тегу.
+      //Ожидание метки то же, что у записи (D16): мигание жёлтым, таймаут 60 с, отмена при выходе из подменю.
+      if (b.Button(web::btn_erase, "Стереть метку", sets::Colors::Red)) {
+        lastUID = 0;  //метка, уже лежащая на считывателе, должна прочитаться заново
+        erasePending = true;
+        writeStart = millis();
+        wstate = WAIT_TAG;
+        T_LED_WRITE.restart();
+        Serial.println("Стирание метки: ожидание метки");
+        logger.println("Стирание метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
+      }
     }
     {
       sets::Group g(b, "Логгер");
@@ -849,6 +861,8 @@ static int tagSpoolID(JsonDocument& doc) {
 
 //Машина записи по касанию метки в WAIT_TAG (определение — в секции «Запись метки v1.3» в конце файла)
 static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocument& tagDoc, bool parsed);
+//Цвет результата записи/стирания (определение — в секции «Запись метки v1.3»)
+static void setWriteResult(uint32_t color);
 
 void readNFC() {
   if (!mfrc522.PICC_IsNewCardPresent()) {
@@ -889,10 +903,17 @@ void readNFC() {
     Serial.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | "") + " (активация заблокирована)");
     logger.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
 
-    //Кнопка «Записать метку» нажата — метка в поле считывателя, запускаем машину записи (D16)
+    //Кнопка «Записать метку»/«Стереть метку» нажата — метка в поле считывателя, запускаем машину (D16).
+    //Намерение (erasePending) снимаем здесь же: иначе следующее касание повторило бы операцию.
     if (wstate == WAIT_TAG) {
-      wstate = WRITING;
-      tagWriteFlow(uid, payload, doc, parsed);
+      bool doErase = erasePending;
+      erasePending = false;
+      wstate = doErase ? ERASING : WRITING;
+      if (doErase) {
+        setWriteResult(eraseTag() ? LIME : RED);
+      } else {
+        tagWriteFlow(uid, payload, doc, parsed);
+      }
       wstate = IDLE;
     }
 
@@ -1347,12 +1368,14 @@ bool linkTagUID(const String& uid, int spoolID, String& holderID) {
   return false;
 }
 
-//D13/D9: DELETE /api/v1/spool/{id}/tag/{uid}. 204 — отвязано; 404 — такой линковки нет.
-bool unlinkTagUID(const String& uid, int spoolID) {
-  if (!uid.length() || spoolID <= 0) return false;
+//DELETE /api/v1/spool/{id}/tag/{uid} — код ответа HTTP (204/200 — снято, 404 — такой линковки нет,
+//<=0 — сеть/таймаут). Вынесено из unlinkTagUID(), чтобы стирание (D9) отличало 404 («не линкована,
+//не ошибка») от реального сбоя и могло проверить линковку на филамент.
+static int unlinkTagRequest(const String& uid, int spoolID) {
+  if (!uid.length() || spoolID <= 0) return -1;
   if (WiFi.status() != WL_CONNECTED) {
     logger.println(sets::Logger::error() + "Отвязка метки " + uid + ": нет WiFi");
-    return false;
+    return -1;
   }
 
   HTTPClient http;
@@ -1363,18 +1386,23 @@ bool unlinkTagUID(const String& uid, int spoolID) {
   int code = http.sendRequest("DELETE");  //в HTTPClient ESP32 нет метода DELETE()
   http.end();
 
+  if (code <= 0) {
+    errorServer(String(code));
+    lastSpoolmanFail = millis();
+  }
+  return code;
+}
+
+//D13/D9: DELETE /api/v1/spool/{id}/tag/{uid}. 204 — отвязано; 404 — такой линковки нет.
+bool unlinkTagUID(const String& uid, int spoolID) {
+  int code = unlinkTagRequest(uid, spoolID);
   if (code == 200 || code == 204) return true;
   if (code == 404) {
     logger.println(sets::Logger::warn() + "Отвязка метки " + uid + ": линковки на ID:" + String(spoolID) + " нет (404)");
     return false;
   }
   Serial.println("Отвязка метки " + uid + ": HTTP " + String(code));
-  if (code <= 0) {
-    errorServer(String(code));
-    lastSpoolmanFail = millis();
-  } else {
-    logger.println(sets::Logger::error() + "Отвязка метки " + uid + ": HTTP " + String(code));
-  }
+  if (code > 0) logger.println(sets::Logger::error() + "Отвязка метки " + uid + ": HTTP " + String(code));
   return false;
 }
 
@@ -1617,17 +1645,234 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
   setWriteResult(linked ? LIME : RED);
 }
 
+//=== Стирание метки v1.3: zero-fill + пустой NDEF + отвязка UID (D9/D14) ===
+
+//GET /api/v1/spool?tag=<uid> — владелец линковки UID в Spoolman (D9: сначала спул, потом филамент).
+//>0 — id катушки, 0 — линковки нет, -1 — запрос не выполнен (ошибка залогирована).
+static int ownerSpoolByTag(const String& uid) {
+  if (!uid.length()) return 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    logger.println(sets::Logger::error() + "Стирание метки " + uid + ": нет WiFi (линковка не проверена)");
+    return -1;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?tag=" + uid;
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.println("Поиск владельца UID " + uid + ": HTTP " + String(code));
+    logger.println(sets::Logger::error() + "Стирание метки " + uid + ": поиск владельца не выполнен (HTTP " + String(code) + ")");
+    if (code <= 0) {
+      errorServer(String(code));
+      lastSpoolmanFail = millis();
+    }
+    return -1;
+  }
+
+  //Ответ — массив катушек с этим тегом (обычно 0 или 1): берём id первой
+  JsonDocument filter;
+  filter[0]["id"] = true;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    logger.println(sets::Logger::error() + "Стирание метки " + uid + ": ошибка разбора ответа поиска владельца (" + String(error.c_str()) + ")");
+    return -1;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  if (arr.isNull() || arr.size() == 0) return 0;
+  int owner = arr[0]["id"] | -1;
+  return owner > 0 ? owner : 0;
+}
+
+//GET /api/v1/filament?tag=<uid> — метка линкована на филамент, а не на катушку.
+//Через API спулов такую линковку не снять (design.md, риск «метка на филаменте») — только лог.
+static bool tagLinkedToFilament(const String& uid) {
+  if (!uid.length() || WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/filament?tag=" + uid;
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    if (code <= 0) {
+      errorServer(String(code));
+      lastSpoolmanFail = millis();
+    }
+    return false;
+  }
+
+  JsonDocument filter;
+  filter[0]["id"] = true;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) return false;
+  JsonArray arr = doc.as<JsonArray>();
+  return !arr.isNull() && arr.size() > 0;
+}
+
+//D9: zero-fill страниц данных 4..(последняя перед динамическими lock-байтами — 129 у NTAG215, 225 у
+//NTAG216, 39 у NTAG213) и пустой NDEF «03 00 FE» в странице 4. CC (стр. 3) в область данных не входит,
+//но без валидного CC телефон не увидит даже пустой NDEF — нестандартный CC приводим к E1 10 <size/8> 00.
+static bool wipeTagChip(const TagChipInfo& chip) {
+  uint8_t cc[18];
+  byte n = sizeof(cc);
+  if (mfrc522.MIFARE_Read(3, cc, &n) != MFRC522::StatusCode::STATUS_OK) {
+    logger.println(sets::Logger::error() + "Стирание метки " + String(chip.name) + ": не читается CC (стр. 3)");
+    return false;
+  }
+  if (cc[0] != 0xE1 || cc[1] != 0x10 || cc[2] != chip.ccSizeCode || cc[3] != 0x00) {
+    logger.println(sets::Logger::warn() + "CC метки " + String(chip.name) + " нестандартен (" + pageHex(cc, 4) + ") — переписываем на E1 10 " + pageHex(&chip.ccSizeCode, 1) + " 00");
+    uint8_t fixed[4] = { 0xE1, 0x10, chip.ccSizeCode, 0x00 };
+    if (mfrc522.MIFARE_Ultralight_Write(3, fixed, 4) != MFRC522::StatusCode::STATUS_OK) {
+      logger.println(sets::Logger::error() + "Стирание метки: не удалось переписать CC (стр. 3)");
+      return false;
+    }
+  }
+
+  //Zero-fill всей области данных, включая страницу 4 (её перезапишем пустым NDEF ниже)
+  uint8_t zero[4] = { 0x00, 0x00, 0x00, 0x00 };
+  uint8_t lastDataPage = (uint8_t)(chip.dynLockPage - 1);
+  for (uint16_t page = NDEF_PAGE_START; page <= lastDataPage; page++) {
+    if (mfrc522.MIFARE_Ultralight_Write((byte)page, zero, 4) != MFRC522::StatusCode::STATUS_OK) {
+      logger.println(sets::Logger::error() + "Стирание метки: ошибка записи страницы " + String(page));
+      return false;
+    }
+  }
+
+  //D9: пустой NDEF — TLV 0x03 с нулевой длиной и терминатор 0xFE в первой странице области NDEF
+  uint8_t empty[4] = { NDEF_TLV_NDEF, 0x00, NDEF_TLV_END, 0x00 };
+  if (mfrc522.MIFARE_Ultralight_Write(NDEF_PAGE_START, empty, 4) != MFRC522::StatusCode::STATUS_OK) {
+    logger.println(sets::Logger::error() + "Стирание метки: не удалось записать пустой NDEF (стр. " + String(NDEF_PAGE_START) + ")");
+    return false;
+  }
+
+  //Подтверждение: страница 4 == 03 00 FE, и NDEF-парсер больше не находит payload
+  uint8_t check[18];
+  n = sizeof(check);
+  if (mfrc522.MIFARE_Read(NDEF_PAGE_START, check, &n) != MFRC522::StatusCode::STATUS_OK) {
+    logger.println(sets::Logger::error() + "Стирание метки: не читается стр. " + String(NDEF_PAGE_START) + " после записи");
+    return false;
+  }
+  if (check[0] != NDEF_TLV_NDEF || check[1] != 0x00 || check[2] != NDEF_TLV_END) {
+    logger.println(sets::Logger::error() + "Стирание метки: проверка пустого NDEF не совпала (" + pageHex(check, 4) + ")");
+    return false;
+  }
+  if (ndefPayload().length()) {
+    logger.println(sets::Logger::error() + "Стирание метки: NDEF-парсер всё ещё находит payload после зачистки");
+    return false;
+  }
+  return true;
+}
+
+//D9/D14: стереть метку. Вызывается по касанию в WAIT_TAG — UID уже прочитан в readNFC().
+//Порядок: lock (D7; read-only -> чип не трогаем, D14) -> zero-fill + пустой NDEF -> подтверждение
+//-> owner-lookup -> DELETE /spool/{id}/tag/{uid} (404 — не линкована, не ошибка).
+//true — цель достигнута: чип очищен, либо чип read-only и линковка снята.
+bool eraseTag() {
+  String uid = formatUID();
+  if (!uid.length()) {
+    logger.println(sets::Logger::error() + "Стирание метки: UID не прочитан");
+    return false;
+  }
+  Serial.println("Стирание метки: UID " + uid);
+  logger.println("Стирание метки " + uid);
+
+  //1) D7/D14: запертую метку не трогаем — только отвязываем UID
+  bool writable = false;
+  bool chipOk = tagLockCheck(writable);
+  bool chipWiped = false;
+  if (!chipOk) {
+    logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": чип не опознан, содержимое не стёрто");
+  } else if (!writable) {
+    logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": чип read-only, содержимое не стёрто");
+  } else {
+    TagChipInfo chip;
+    tagChipInfo(chip);
+    chipWiped = wipeTagChip(chip);
+    if (!chipWiped) {
+      //Метку не очистили — линковку не снимаем: иначе UID-first останется без содержимого,
+      //а старая катушка в Spoolman «потеряет» метку при живом spool_id на чипе.
+      logger.println(sets::Logger::error() + "Стирание метки " + uid + " не удалось: чип не очищен, линковка не снята");
+      return false;
+    }
+    logger.println("Стирание метки " + uid + ": чип очищен, NDEF пуст (стр. " + String(NDEF_PAGE_START) + " = 03 00 FE)");
+  }
+
+  //2) D9: отвязка UID — владелец по тегу, затем DELETE. 404 = линковки нет (не ошибка).
+  bool done = true;
+  int owner = ownerSpoolByTag(uid);
+  if (owner > 0) {
+    int code = unlinkTagRequest(uid, owner);
+    if (code == 200 || code == 204) {
+      if (chipWiped) {
+        Serial.println("Стирание метки " + uid + ": линковка с катушкой ID:" + String(owner) + " снята");
+        logger.println("Стирание метки " + uid + ": линковка с катушкой ID:" + String(owner) + " снята");
+      } else {
+        //D14: чип не тронут, но UID отвязан — ровно то, что предписывает решение
+        Serial.println("Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
+        logger.println(sets::Logger::warn() + "Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
+      }
+    } else if (code == 404) {
+      //На этой катушке линковки нет: метка могла быть привязана к филаменту
+      if (tagLinkedToFilament(uid)) {
+        logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": линковка на филамент, снимите вручную");
+        done = false;
+      } else {
+        logger.println("Стирание метки " + uid + ": линковки на катушке ID:" + String(owner) + " нет (404)");
+      }
+    } else {
+      logger.println(sets::Logger::error() + "Стирание метки " + uid + ": отвязка от катушки ID:" + String(owner) + " не удалась (HTTP " + String(code) + ")");
+      done = false;
+    }
+  } else if (owner == 0) {
+    if (tagLinkedToFilament(uid)) {
+      logger.println(sets::Logger::warn() + "Стирание метки " + uid + ": линковка на филамент, снимите вручную");
+      done = false;
+    } else {
+      logger.println("Стирание метки " + uid + ": метка не линкована");
+    }
+  } else {
+    //-1: запрос владельца не выполнен (залогировано) — состояние линковки неизвестно
+    done = false;
+  }
+
+  //3) Финал: содержимого на чипе больше нет, поэтому поля «Метка в поле считывателя» очищаем.
+  //Если чип read-only, поля оставляем — они отражают то, что реально лежит на метке (как в T3).
+  if (chipWiped) {
+    db[web::w_id] = 0;
+    db[web::w_uid] = "";
+    db[web::w_type] = "";
+    db[web::w_brand] = "";
+  }
+  return done;
+}
+
 //D16: тик ожидания метки — таймаут 60 с и мигание жёлтым (приоритет над статусным LED).
 //true — LED в этом тике ведёт ожидание метки, статусный updateLED() вызывать не нужно.
 bool writeTick() {
   T_LED_WRITE.tick();
 
-  if (wstate != IDLE && !writeMode) wstate = IDLE;  //вышли из подменю — ожидание не продолжается
+  if (wstate != IDLE && !writeMode) {  //вышли из подменю — ожидание не продолжается
+    wstate = IDLE;
+    erasePending = false;
+  }
 
   if (wstate == WAIT_TAG && millis() - writeStart > WRITE_TAG_TIMEOUT) {
+    //Ожидание было либо записью, либо стиранием (D9) — в логе называем операцию так, как её запускали
+    String op = erasePending ? "Стирание метки" : "Запись метки";
     wstate = IDLE;
-    Serial.println("Запись метки: таймаут ожидания, отменено");
-    logger.println(sets::Logger::warn() + "Запись метки: метка не приложена за " + String(WRITE_TAG_TIMEOUT / 1000) + " с, отменено");
+    erasePending = false;
+    Serial.println(op + ": таймаут ожидания, отменено");
+    logger.println(sets::Logger::warn() + op + ": метка не приложена за " + String(WRITE_TAG_TIMEOUT / 1000) + " с, отменено");
   }
 
   if (wstate != WAIT_TAG) return false;
