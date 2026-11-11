@@ -43,6 +43,72 @@
 <img width="640" height="480" alt="shem" src="img/foto2.jpg" />
 <img width="640" height="480" alt="shem" src="img/foto3.jpg" />
 
+## Прошивка и обновление (OTA)
+
+С v1.3 устройство собирается под кастомной разметкой flash на 4 МБ — два OTA-слота,
+поэтому обновление прошивки возможно по сети, без USB. Разметка лежит в
+`src/esp32_spoolman/partitions.csv` (обязательно в каталоге скетча: prebuild-hook ядра
+копирует её в build path, и она перекрывает разметку из меню платы).
+
+| Раздел | Тип | Смещение | Размер |
+|---|---|---|---|
+| nvs | data/nvs | 0x009000 | 20 КБ |
+| otadata | data/ota | 0x00E000 | 8 КБ |
+| app0 | app/ota_0 | 0x010000 | 0x190000 (1.56 МБ) |
+| app1 | app/ota_1 | 0x1A0000 | 0x190000 (1.56 МБ) |
+| spiffs (LittleFS, настройки) | data/spiffs | 0x330000 | 768 КБ |
+| coredump | data/coredump | 0x3F0000 | 64 КБ |
+
+Сборка (те же опции платы, что и раньше, плюс кастомная разметка):
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota,CDCOnBoot=cdc \
+  --build-property "build.partitions=custom" \
+  --build-property "upload.maximum_size=1638400" \
+  --build-path /tmp/esp32_spoolman-build src/esp32_spoolman
+```
+
+`upload.maximum_size=1638400` (0x190000) — реальный размер OTA-слота. Без него
+`PartitionScheme=no_ota` рапортует ложный лимит 2 МБ из меню платы. Текущий образ
+занимает 1 370 747 Б (83% слота), запас ~261 КБ; приложение, выросшее за 1.56 МБ,
+прошиваться не будет.
+
+### Первый выкат — только по USB
+
+Разметку нельзя сменить по OTA: устройство, прошитое старой таблицей (`no_ota`,
+один слот), не найдёт второй OTA-слот. Первая прошивка v1.3 — по USB:
+
+```bash
+arduino-cli upload -p /dev/ttyACM0 \
+  --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota,CDCOnBoot=cdc \
+  --build-path /tmp/esp32_spoolman-build src/esp32_spoolman
+```
+
+В Arduino IDE достаточно выбрать те же опции платы и нажать «Загрузка».
+
+После первой прошивки настройки сбрасываются: раздел LittleFS переехал
+(0x210000 → 0x330000), старый `data.db` не читается и создаётся заново. Устройство
+снова поднимет точку доступа «ESP to Spoolman» — Wi-Fi, адреса Spoolman/Moonraker
+нужно ввести заново.
+
+### Дальнейшие обновления — по OTA
+
+1. Собрать образ той же командой (разметка custom) — нужен только `esp32_spoolman.ino.bin`.
+2. Кнопка «Обновить прошивку» в web-интерфейсе устройства (Настройки) — выбрать файл
+   `esp32_spoolman.ino.bin`, устройство запишет его во второй слот и перезагрузится.
+3. Либо из консоли:
+
+```bash
+curl --data-binary @/tmp/esp32_spoolman-build/esp32_spoolman.ino.bin \
+  http://<ip-устройства>/ota
+```
+
+`/ota` открыт без пароля в локальной сети (осознанный риск для доверенного сегмента).
+После перезагрузки устройство стартует с нового слота; при неудачном обновлении
+загрузчик остаётся на рабочем образе. Настройки (LittleFS) и NVS при OTA не
+затрагиваются — повторная настройка Wi-Fi не требуется. Откат — залить предыдущий
+`esp32_spoolman.ino.bin` тем же способом.
+
 ## Changelog
 
 ### v1.2
