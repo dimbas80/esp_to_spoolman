@@ -8,10 +8,21 @@
 // Переходы:
 //   IDLE --begin(spoolID)--> WAIT_CONFIRM --confirm()--> CONFIRMED --(запись)--> IDLE
 //                                  \--expired(now, timeout)--> IDLE (отмена)
+//                                  \--reply(false), т.е. «Отмена»--> IDLE (отмена, без записи)
 //   clear() из любого состояния — отмена (выход из меню, новая метка, отмена по таймауту).
+//
+// Ответ из вебморды разбирает reply(bool): он отделяет OK от «Отмены». Это не формальность:
+// Builder::_isSet (Settings v1.3.16, core/builder.h:771) возвращает true на ЛЮБОЕ Set-действие с
+// совпавшим id и само значение не смотрит — «Отмена» приходит тем же Set-пакетом со значением 0.
 #pragma once
 
 namespace wconfirm {
+
+//Ответ владельца из вебморды (окно Confirm): 1 — OK, 0 — «Отмена».
+//Ignore — отвечать нечему: подтверждения не ждём либо оно уже получено (второй ответ не должен
+//ни отменять, ни повторять запись). Значение читается вызывающим кодом из Set-пакета явно
+//(b.Confirm(id, label, &ok)) — сам факт Set-действия подтверждением не является.
+enum class Reply { Ignore, Confirm, Cancel };
 
 class State {
    public:
@@ -41,6 +52,14 @@ class State {
         if (!_pending || _confirmed) return false;
         _confirmed = true;
         return true;
+    }
+
+    //Ответ владельца из вебморды (окно Confirm): 1 — OK, 0 — «Отмена» (см. enum Reply).
+    //Значение читается вызывающим кодом из Set-пакета явно (b.Confirm(id, label, &ok)) —
+    //сам факт Set-действия подтверждением не является.
+    Reply reply(bool ok) const {
+        if (!_pending || _confirmed) return Reply::Ignore;
+        return ok ? Reply::Confirm : Reply::Cancel;
     }
 
     //Ожидание подтверждения истекло (отсчёт от begin, а не от нажатия кнопки: у владельца

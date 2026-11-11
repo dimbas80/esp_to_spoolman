@@ -78,6 +78,13 @@ int conflictSpool = 0;    //D13: спул-владелец UID из 409
 wconfirm::State tagConfirm;
 static String pendingUID = "";      //UID метки, ожидающей подтверждения
 static String pendingPayload = "";  //её содержимое (NDEF payload) — по нему восстанавливается doc
+//D33/F1 (T-H3): окно Confirm — СКРЫТЫЙ узел фронтенда (web/settings.h v1.3.16: конструктор ставит
+//display:none, браузерный AsyncConfirm вызывается только из update()). Значит одного рисования в
+//build() мало: нужен отдельный update-пакет на id окна. Флаг — «активация для текущей отрисовки
+//страницы уже отправлена»: снимается при каждой перерисовке страницы, где узел нарисован, иначе
+//диалог всплывал бы на каждом опросе (~2,5 с); повтор после перерисовки нужен потому, что update
+//на ещё не созданный виджет фронтенд молча отбрасывает.
+static bool confirmActivationSent = false;
 
 //D33: снять ожидание подтверждения и забыть запомненную метку — только вместе: автомат и
 //сохранённый UID/payload не должны разъезжаться (иначе подтверждение запишет чужую метку).
@@ -85,6 +92,7 @@ static void clearPendingConfirm() {
   tagConfirm.clear();
   pendingUID = "";
   pendingPayload = "";
+  confirmActivationSent = false;  //следующее ожидание активирует окно заново
 }
 unsigned long lastSpoolmanFail = 0;
 unsigned long lastMoonrakerFail = 0;
@@ -239,8 +247,36 @@ void build(sets::Builder& b) {
       if (tagConfirm.pending()) {
         String linked = String(tagConfirm.spoolID());
         b.Label("Метка залинкована к катушке ID:", linked);
-        if (b.Confirm(web::confirm_write, "Записать на залинкованную метку")) {
-          tagConfirm.confirm();
+        //D33/F1 (T-H3): узел Confirm скрыт, диалог открывает update-пакет из update() (см. там же).
+        //Флаг «активация отправлена» снимаем, когда страница с этим узлом действительно
+        //(пере)рисована: полная сборка (Build) или вход в меню записи. Иначе пакет активации мог
+        //уйти в никуда (виджета ещё не было), а лишний сброс на чужом действии дал бы второе окно
+        //поверх ещё не закрытого.
+        if (b.build.isBuild() || enteredWrite) confirmActivationSent = false;
+        //D33/F2 (T-H3): Builder::_isSet возвращает true на ЛЮБОЕ Set-действие с этим id и значение
+        //не смотрит, поэтому ответ диалога читаем явно (&ok): OK (1) — подтверждение, «Отмена» (0) —
+        //отмена, как по таймауту. Иначе «Отмена» тоже запускала бы запись.
+        bool ok = false;
+        if (b.Confirm(web::confirm_write, "Записать на залинкованную метку", &ok)) {
+          switch (tagConfirm.reply(ok)) {
+            case wconfirm::Reply::Confirm:
+              tagConfirm.confirm();
+              Serial.println("Запись метки " + pendingUID + ": подтверждена в вебморде");
+              logger.println("Метка " + pendingUID + ": запись подтверждена в вебморде");
+              break;
+            case wconfirm::Reply::Cancel: {
+              String uid = pendingUID;
+              wstate = IDLE;  //отмена = как по таймауту: ожидание метки и запись сняты
+              erasePending = false;
+              clearPendingConfirm();
+              Serial.println("Запись метки " + uid + ": отменена в вебморде");
+              logger.println(sets::Logger::warn() + "Запись метки " + uid + ": отменена в вебморде, запись не выполнена");
+              sett.reload();  //окно и подсказка должны исчезнуть из вебморды
+              break;
+            }
+            default:
+              break;  //ответа не ждали или подтверждение уже получено — ничего не делаем
+          }
         }
       }
     }
@@ -396,6 +432,25 @@ void update(sets::Updater& upd) {
       lastGates[i] = gateTexts[i];
       upd.update(gateIds[i], gateTexts[i]);
     }
+  }
+
+  //D33/F1 (T-H3): активация окна подтверждения. Узел Confirm — скрытый (web/settings.h v1.3.16:
+  //в конструкторе display:none), браузерный диалог AsyncConfirm открывается ТОЛЬКО из его update()
+  //— контракт библиотеки (core/builder.h:653) и эталонный паттерн (demo_data.ino:99-118: кнопка
+  //ставит флаг, update() шлёт пакет). Рисования в build() недостаточно: без пакета владелец не
+  //увидит окна и подтвердить запись не сможет. Шлём один раз на отрисовку страницы (флаг снимает
+  //build), текст диалога — что именно подтверждается.
+  if (tagConfirm.pending() && !tagConfirm.confirmed() && !confirmActivationSent) {
+    confirmActivationSent = true;
+    String dialog = "Метка залинкована к катушке ID ";
+    dialog += String(tagConfirm.spoolID());
+    dialog += " — подтвердить запись?";
+    //ID берём ТОЛЬКО из web::confirm_write — тот же, каким виджет нарисован в build().
+    //H(confirm_write) здесь не годится: DB_KEYS маскирует хэш (DB_HASH_MASK, GyverDB), поэтому
+    //H("confirm_write")=0x7E7CABB8, а web::confirm_write=0x1E7CABB8 — пакет ушёл бы на
+    //несуществующий виджет и фронтенд молча его отбросил бы (проверено компилятором на этой плате).
+    const size_t id = (size_t)web::confirm_write;
+    upd.update(id, dialog);  //текст диалога; String, а не StringSumHelper — иначе template-update
   }
 }
 
