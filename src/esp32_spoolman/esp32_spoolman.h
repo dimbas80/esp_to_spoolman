@@ -69,7 +69,19 @@ DB_KEYS(
   nfc_id,
   nfc_name,
   nfc_brand,
-  nfc_color
+  nfc_color,
+  //Подменю «Записать метку» (v1.3): таб, список катушек и поля режима записи
+  tab,        //0 — настройки, 1 — запись метки
+  spool_sel,  //индекс выбранной опции Select (НЕ id катушки — см. spool_ids)
+  spool_ids,  //csv id катушек параллельно опциям Select
+  spool_opts, //опции Select через ';'
+  f_notag,    //фильтр «только катушки без метки»
+  w_id,
+  w_uid,
+  w_type,
+  w_brand,
+  btn_write,
+  btn_erase
 );
 
 extern bool LED_SP;
@@ -81,6 +93,10 @@ extern bool fl_status;
 extern bool fl_led;
 extern bool mmu;
 extern uint32_t lastUID;
+//Режим записи (D10): true — активация катушки, MMU и tag/scan заблокированы
+extern bool writeMode;
+//Максимум опций в списке катушек (Select): больше — усечение + лог
+#define N_OPT_MAX 60
 extern unsigned long lastSpoolmanFail;
 extern unsigned long lastMoonrakerFail;
 extern bool prevSpoolmanOk;   //предыдущее состояние Spoolman (для лога изменений)
@@ -111,3 +127,7 @@ String formatUID();                                          //полный UID 
 String ndefPayload();                                        //payload NDEF-записи («» если TLV/запись не распарсились)
 bool spoolIDByUID(const String& uid, int& matched);           //POST /api/v1/tag/scan; true если matched_spool_id — число
 bool parseTagJSON(const String& payload, JsonDocument& doc);  //openspool (protocol/spool_id) либо FilaMan (sm_id)
+
+//Режим записи v1.3: список катушек для Select и id выбранной катушки
+bool fetchSpoolList(bool noTagOnly);  //GET /api/v1/spool?allow_archived=false -> spool_opts + spool_ids
+int selectedSpoolID();               //id из spool_ids по индексу spool_sel; -1 если ничего не выбрано

@@ -30,6 +30,7 @@ bool wifiSettingMode = 0;
 bool fl_status = false;
 bool fl_led = false;
 bool mmu = false;
+bool writeMode = false;  //D10: режим записи — активация катушки/MMU/tag-scan заблокированы
 uint32_t lastUID = 0;
 unsigned long lastSpoolmanFail = 0;
 unsigned long lastMoonrakerFail = 0;
@@ -40,8 +41,62 @@ TimerMs T_LED_WIFI(500, 1, 0);
 TimerMs ResetLED(1000, 1, 0);
 TimerMs WatchdogNFC(30000, 1, 0);
 
+//Сброс write-состояния: вызывается на ЛЮБОЙ переход таба (Review Focus 4),
+//чтобы выход из подменю не оставлял активного ожидания метки.
+static void resetWriteState() {
+  db[web::w_id] = 0;
+  db[web::w_uid] = "";
+  db[web::w_type] = "";
+  db[web::w_brand] = "";
+  lastUID = 0;  //метка, прочитанная до входа в режим, должна читаться заново
+}
+
 //Интерфейс настроек
 void build(sets::Builder& b) {
+  //Табы: 0 — настройки, 1 — «Записать метку» (b.Tabs отдаёт индекс опции)
+  int tab = db[web::tab];
+  if (b.Tabs(web::tab, "Настройки;Записать метку")) {
+    tab = db[web::tab];  //SettingsBase пишет значение в БД до вызова build()
+    resetWriteState();
+    if (tab == 1) {
+      logger.println("Режим записи: активация катушки заблокирована");
+      fetchSpoolList((bool)db[web::f_notag]);
+    } else {
+      logger.println("Режим настроек: активация катушки разрешена");
+    }
+  }
+
+  if (tab == 1) {
+    //==== Подменю «Записать метку» (D10: только чтение метки, активация заблокирована) ====
+    {
+      sets::Group g(b, "Катушка для записи");
+      if (b.Switch(web::f_notag, "Только катушки без метки")) {
+        db[web::spool_sel] = 0;  //после смены фильтра индексы опций другие
+        fetchSpoolList((bool)db[web::f_notag]);
+      }
+      String opts = db[web::spool_opts];
+      b.Select(web::spool_sel, "Катушка", opts);
+    }
+    {
+      sets::Group g(b, "Метка в поле считывателя");
+      b.Label(web::w_id, "ID:");
+      b.Label(web::w_uid, "UID:");
+      b.Label(web::w_type, "Материал:");
+      b.Label(web::w_brand, "Производитель:");
+    }
+    {
+      sets::Group g(b, "Действия");
+      //Обработчики кнопок — машина записи/стирания (Task 3/4)
+      b.Button(web::btn_write, "Записать метку");
+      b.Button(web::btn_erase, "Стереть метку", sets::Colors::Red);
+    }
+    {
+      sets::Group g(b, "Логгер");
+      b.Log(H(log), logger);
+    }
+    return;
+  }
+
   {
     sets::Group g(b, "WiFi");
     b.Input(web::wifi_ssid, "SSID");
@@ -143,6 +198,18 @@ void setup() {
   db.init(web::nfc_color, "");
   db.init(web::id, 0);
   db.init(web::filament, "");
+  //Ключи подменю «Записать метку» (v1.3 Task 2)
+  db.init(web::tab, 0);
+  db.init(web::spool_sel, 0);
+  db.init(web::spool_ids, "");
+  db.init(web::spool_opts, "");
+  db.init(web::f_notag, false);
+  db.init(web::w_id, 0);
+  db.init(web::w_uid, "");
+  db.init(web::w_type, "");
+  db.init(web::w_brand, "");
+  db.init(web::btn_write, 0);
+  db.init(web::btn_erase, 0);
   mmu = db[web::sw_mmu]; 
   db[web::nfc_id] = 0;
   db[web::nfc_name] = "";
@@ -150,6 +217,17 @@ void setup() {
   db[web::nfc_color] = "";
   db[web::id] = 0;
   db[web::filament] = "";
+  //Режим записи не переживает перезагрузку: иначе блокировка активации «залипнет»
+  db[web::tab] = 0;
+  db[web::spool_sel] = 0;
+  db[web::f_notag] = false;
+  db[web::spool_ids] = "";
+  db[web::spool_opts] = "";
+  db[web::w_id] = 0;
+  db[web::w_uid] = "";
+  db[web::w_type] = "";
+  db[web::w_brand] = "";
+  writeMode = false;
 
   pinMode(SW_WIFI, INPUT_PULLUP);
 
@@ -240,6 +318,9 @@ void loop() {
       WiFi.reconnect();
     }
   }
+
+  //Режим записи — производное от активного таба (0 — настройки, 1 — записать метку)
+  writeMode = ((int)db[web::tab] == 1);
 
   readNFC();
 
@@ -428,6 +509,12 @@ bool getIDSpool(int ID) {
 }
 
 void SetSpool(int SetID) {
+  //D10: в режиме записи активация катушки запрещена — печать не прерываем
+  if (writeMode) {
+    Serial.println("Режим записи: установка катушки ID " + String(SetID) + " заблокирована");
+    logger.println(sets::Logger::warn() + "Режим записи: установка катушки ID " + String(SetID) + " заблокирована");
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED) {
     if (getIDSpool(SetID)) {
       HTTPClient http;
@@ -481,6 +568,7 @@ void SetSpool(int SetID) {
 }
 
 void mmu_next_spoolid(int SetID) {
+  if (writeMode) return;  //D10: в режиме записи MMU не трогаем
   if (WiFi.status() == WL_CONNECTED) {
     if (getIDSpool(SetID)) {
       HTTPClient http;
@@ -753,12 +841,26 @@ void readNFC() {
   Serial.print("Метка UID: ");
   Serial.println(uid);
 
-  //Содержимое метки читаем всегда: из него заполняются поля nfc_* (ID/тип/бренд/цвет)
+  //Содержимое метки читаем всегда: из него заполняются поля (nfc_* либо w_*)
   String payload = ndefPayload();
   JsonDocument doc;
-  int tagID = -1;
-  if (parseTagJSON(payload, doc)) {
-    tagID = tagSpoolID(doc);
+  bool parsed = parseTagJSON(payload, doc);
+  int tagID = parsed ? tagSpoolID(doc) : -1;
+
+  //=== Режим записи (D10): только читаем метку и заполняем поля w_*, активация заблокирована ===
+  if (writeMode) {
+    db[web::w_id] = tagID > 0 ? tagID : 0;
+    db[web::w_uid] = uid;
+    db[web::w_type] = doc["type"] | "";
+    db[web::w_brand] = doc["brand"] | "";
+    mfrc522.PICC_HaltA();
+    sett.reload();
+    Serial.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | "") + " (активация заблокирована)");
+    logger.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
+    return;
+  }
+
+  if (parsed) {
     db[web::nfc_id] = tagID > 0 ? tagID : 0;
     db[web::nfc_name] = doc["type"] | "";
     db[web::nfc_brand] = doc["brand"] | "";
@@ -800,4 +902,113 @@ void readNFC() {
   Serial.println(payload);
   logger.println(sets::Logger::error() + "Метка " + uid + " не распознана (нет линковки и NDEF-формата)");
   set_led_color(RED);
+}
+
+//=== Режим записи: список катушек для Select ===
+
+//GET /api/v1/spool?allow_archived=false -> опции «{id} — {filament.name}» через ';' в spool_opts
+//и параллельный csv id в spool_ids: b.Select отдаёт индекс опции, а не id катушки (Review Focus 3).
+//noTagOnly — только катушки без tags. Больше N_OPT_MAX опций — усечение + лог (Q8).
+bool fetchSpoolList(bool noTagOnly) {
+  db[web::spool_opts] = "";
+  db[web::spool_ids] = "";
+
+  if (WiFi.status() != WL_CONNECTED) {
+    logger.println(sets::Logger::error() + "Список катушек: нет WiFi");
+    return false;
+  }
+  if (millis() - lastSpoolmanFail < RETRY_DELAY) {
+    logger.println(sets::Logger::warn() + "Список катушек: Spoolman недоступен, повтор позже");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?allow_archived=false";
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int httpResponseCode = http.GET();
+  if (httpResponseCode != 200) {
+    http.end();
+    Serial.println("Список катушек: HTTP " + String(httpResponseCode));
+    logger.println(sets::Logger::error() + "Список катушек: HTTP " + String(httpResponseCode));
+    lastSpoolmanFail = millis();
+    return false;
+  }
+
+  //Ответ на проде ~54 КБ — в JsonDocument целиком не влезает: читаем поток с фильтром нужных полей
+  JsonDocument filter;
+  filter[0]["id"] = true;
+  filter[0]["filament"]["name"] = true;
+  filter[0]["tags"] = true;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    Serial.print("Список катушек: ошибка разбора ");
+    Serial.println(error.c_str());
+    logger.println(sets::Logger::error() + "Список катушек: ошибка разбора " + String(error.c_str()));
+    lastSpoolmanFail = millis();
+    return false;
+  }
+
+  String opts, ids;
+  int matched = 0, cnt = 0;
+  for (JsonObject sp : doc.as<JsonArray>()) {
+    //Фильтр «только без метки»: у катушки нет ни одной привязанной метки
+    if (noTagOnly && sp["tags"].size() > 0) continue;
+    matched++;
+    if (cnt >= N_OPT_MAX) continue;  //дальше только считаем, чтобы залогировать усечение
+
+    int spoolID = sp["id"] | -1;
+    if (spoolID <= 0) continue;
+    String name = sp["filament"]["name"] | "";
+    //';' и перевод строки — разделители опций Select: подменяем в имени, иначе список «съедет»
+    name.replace(';', ',');
+    name.replace('\n', ' ');
+
+    if (cnt) {
+      opts += ';';
+      ids += ',';
+    }
+    opts += String(spoolID) + " — " + name;
+    ids += String(spoolID);
+    cnt++;
+  }
+
+  db[web::spool_opts] = opts;
+  db[web::spool_ids] = ids;
+  int sel = db[web::spool_sel];
+  if (sel < 0 || sel >= cnt) db[web::spool_sel] = 0;  //после смены фильтра индексов могло стать меньше
+
+  if (matched > cnt) {
+    logger.println(sets::Logger::warn() + "Список сокращён: " + String(cnt) + " из " + String(matched) + " (лимит " + String(N_OPT_MAX) + ")");
+  } else if (cnt == 0) {
+    logger.println(sets::Logger::warn() + "Список катушек пуст" + String(noTagOnly ? " (фильтр «без метки»)" : ""));
+  } else {
+    logger.println("Список катушек: " + String(cnt));
+  }
+  return cnt > 0;
+}
+
+//id катушки по индексу выбранной опции Select: id берём из параллельного spool_ids (Review Focus 3).
+//-1 — ничего не выбрано либо списка нет.
+int selectedSpoolID() {
+  int idx = db[web::spool_sel];
+  if (idx < 0) return -1;
+
+  String ids = db[web::spool_ids];
+  int cur = 0, start = 0;
+  while (start <= (int)ids.length()) {
+    int end = ids.indexOf(',', start);
+    String part = (end < 0) ? ids.substring(start) : ids.substring(start, end);
+    if (cur == idx) {
+      int id = part.toInt();
+      return id > 0 ? id : -1;
+    }
+    if (end < 0) break;
+    start = end + 1;
+    cur++;
+  }
+  return -1;
 }
