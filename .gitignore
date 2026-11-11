@@ -26,3 +26,18 @@ __pycache__/
 .DS_Store
 
 # Arduino build artifacts
+
+# Тяжёлые артефакты отладки — не в git
+build/*.elf
+build/*.map
+build/cache/
+build/core/
+build/libraries/
+build/sketch/
+build/*.json
+build/file_opts
+build/flash_args
+build/*.cache
+build/sdkconfig
+build/partitions.csv
+build/build_opt.h
