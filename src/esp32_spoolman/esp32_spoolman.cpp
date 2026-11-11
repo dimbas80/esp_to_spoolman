@@ -112,6 +112,8 @@ void updateLED() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("Версия " VER);
+  logger.println("Версия " VER);
   strip.begin();
   strip.setBrightness(50);
   strip.clear();
@@ -504,6 +506,229 @@ void mmu_next_spoolid(int SetID) {
   }
 }
 
+//=== Чтение метки v1.3: NDEF TLV-парсер + UID-first + диспетчер форматов ===
+
+//Память пользователя NTAG21x начинается со страницы 4 (стр.0-1 UID, стр.2 lock, стр.3 CC)
+#define NDEF_PAGE_START 4
+#define NDEF_MAX_BYTES  888  //NTAG216 — верхняя граница; NTAG215: 496, NTAG213: 144
+
+#define NDEF_TLV_NULL   0x00  //NULL TLV — пропускаем
+#define NDEF_TLV_NDEF   0x03  //NDEF Message TLV — то, что нам нужно
+#define NDEF_TLV_END    0xFE  //Terminator TLV — дальше TLV-структуры нет
+#define NDEF_TLV_LONG   0xFF  //признак 16-битной длины TLV
+
+//Возможные исходы разбора TLV (нужны, чтобы читать память кусками до исчерпания длины)
+#define NDEF_SCAN_MORE    0  //TLV/запись ещё не дочитаны — нужен следующий кусок
+#define NDEF_SCAN_FOUND   1  //payload найден: *payloadOfs, *payloadLen
+#define NDEF_SCAN_STOPPED 2  //0xFE или битая структура — NDEF-записи на метке нет
+
+//Разбор заголовка одной NDEF-записи: flags(TNF|IL|SR|ME), TYPE_LENGTH, PAYLOAD_LENGTH, [ID_LENGTH], TYPE, payload.
+//Читаем только первую запись (openspool/FilaMan пишут одну).
+static uint16_t ndefParseRecord(const uint8_t* msg, uint16_t msgLen, uint16_t* payloadOfs) {
+  if (msgLen < 3) return 0;
+  uint8_t flags = msg[0];
+  bool shortRecord = flags & 0x10;  //SR: длина payload в 1 байте
+  bool idLength = flags & 0x08;     //IL: есть ID_LENGTH
+  uint8_t typeLen = msg[1];
+  uint16_t pos = 2;
+
+  uint32_t payloadLen;
+  if (shortRecord) {
+    payloadLen = msg[pos];
+    pos += 1;
+  } else {
+    if ((uint32_t)pos + 4 > msgLen) return 0;
+    payloadLen = ((uint32_t)msg[pos] << 24) | ((uint32_t)msg[pos + 1] << 16) | ((uint32_t)msg[pos + 2] << 8) | msg[pos + 3];
+    pos += 4;
+  }
+
+  if (idLength) {
+    if ((uint32_t)pos + 1 > msgLen) return 0;
+    uint8_t idLen = msg[pos];
+    pos += 1;
+    if ((uint32_t)pos + idLen > msgLen) return 0;
+    pos += idLen;
+  }
+
+  pos += typeLen;
+  if (payloadLen == 0 || (uint32_t)pos + payloadLen > msgLen) return 0;
+  *payloadOfs = pos;
+  return (uint16_t)payloadLen;  //payloadLen <= msgLen <= NDEF_MAX_BYTES — в uint16 влезает
+}
+
+//Разбор TLV-структуры: 0x03 + длина (1 байт либо 0xFF + 2 байта) + значение.
+//Остальные TLV (Lock/Memory Control/Proprietary) пропускаем по длине.
+static uint8_t ndefScanTLV(const uint8_t* mem, uint16_t memLen, uint16_t* payloadOfs, uint16_t* payloadLen) {
+  uint16_t pos = 0;
+  while (pos < memLen) {
+    uint8_t type = mem[pos];
+    if (type == NDEF_TLV_END) return NDEF_SCAN_STOPPED;
+    if (type == NDEF_TLV_NULL) {
+      pos++;
+      continue;
+    }
+    if (pos + 1 >= memLen) return NDEF_SCAN_MORE;
+
+    uint32_t len = mem[pos + 1];
+    uint16_t hdrLen = 2;
+    if (len == NDEF_TLV_LONG) {
+      if ((uint32_t)pos + 4 > memLen) return NDEF_SCAN_MORE;
+      len = ((uint32_t)mem[pos + 2] << 8) | mem[pos + 3];
+      hdrLen = 4;
+    }
+
+    uint32_t valueOfs = (uint32_t)pos + hdrLen;
+    if (valueOfs + len > memLen) {
+      //TLV-длина ещё не исчерпана: для 0x03 — ждём следующие страницы, для прочих TLV — структура битая
+      return (type == NDEF_TLV_NDEF) ? NDEF_SCAN_MORE : NDEF_SCAN_STOPPED;
+    }
+
+    if (type == NDEF_TLV_NDEF) {
+      uint16_t ofs = 0;
+      uint16_t lenPayload = ndefParseRecord(mem + valueOfs, (uint16_t)len, &ofs);
+      if (lenPayload == 0) return NDEF_SCAN_STOPPED;
+      *payloadOfs = (uint16_t)valueOfs + ofs;
+      *payloadLen = lenPayload;
+      return NDEF_SCAN_FOUND;
+    }
+    pos = (uint16_t)(valueOfs + len);
+  }
+  return NDEF_SCAN_MORE;
+}
+
+//Полный UID (4/7/10 байт) в hex UPPERCASE без разделителей — формат Spoolman tag API.
+//uint32-хеш для дедупа считается отдельно в readNFC().
+String formatUID() {
+  String uid;
+  uid.reserve(mfrc522.uid.size * 2);
+  static const char hex[] = "0123456789ABCDEF";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uid += hex[(mfrc522.uid.uidByte[i] >> 4) & 0x0F];
+    uid += hex[mfrc522.uid.uidByte[i] & 0x0F];
+  }
+  return uid;
+}
+
+//Payload NDEF-записи (application/json у openspool/FilaMan). «» — если TLV/запись не распарсились.
+//Читаем страницы с 4-й кусками по 4 страницы (MIFARE_Read отдаёт 16 байт + 2 CRC),
+//пока не исчерпана TLV-длина, не встретится 0xFE, не кончится память метки или лимит NDEF_MAX_BYTES.
+String ndefPayload() {
+  static uint8_t mem[NDEF_MAX_BYTES];  //вне стека loop(): до 888 байт
+  uint16_t memLen = 0;
+  uint8_t buffer[18];
+
+  for (uint16_t page = NDEF_PAGE_START; memLen < NDEF_MAX_BYTES; page += 4) {
+    byte byteCount = sizeof(buffer);
+    if (mfrc522.MIFARE_Read((byte)page, buffer, &byteCount) != MFRC522::StatusCode::STATUS_OK) {
+      break;  //дальше страниц нет (NTAG213/215) либо ошибка чтения
+    }
+    for (byte i = 0; i < 16 && memLen < NDEF_MAX_BYTES; i++) {
+      mem[memLen++] = buffer[i];
+    }
+
+    uint16_t payloadOfs = 0, payloadLen = 0;
+    uint8_t scan = ndefScanTLV(mem, memLen, &payloadOfs, &payloadLen);
+    if (scan == NDEF_SCAN_FOUND) {
+      String payload;
+      payload.reserve(payloadLen);
+      for (uint16_t i = 0; i < payloadLen; i++) {
+        payload += (char)mem[payloadOfs + i];
+      }
+      return payload;
+    }
+    if (scan == NDEF_SCAN_STOPPED) break;
+  }
+  return "";
+}
+
+//UID-first: POST /api/v1/tag/scan {"uid":...,"reader_id":"esp32-to-spoolman"}.
+//true — Spoolman нашёл линковку UID -> катушка (*matched = matched_spool_id).
+bool spoolIDByUID(const String& uid, int& matched) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!uid.length()) return false;
+  if (millis() - lastSpoolmanFail < RETRY_DELAY) return false;
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/tag/scan";
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument request;
+  request["uid"] = uid;
+  request["reader_id"] = READER_ID;
+  String requestBody;
+  serializeJson(request, requestBody);
+
+  int httpResponseCode = http.POST(requestBody);
+  String response;
+  if (httpResponseCode > 0) response = http.getString();
+  http.end();  //единственный end(), до разбора JSON
+
+  if (httpResponseCode <= 0) {
+    errorServer(String(httpResponseCode));
+    lastSpoolmanFail = millis();
+    return false;
+  }
+  if (httpResponseCode != 200) {
+    Serial.println("tag/scan: HTTP " + String(httpResponseCode));
+    logger.println(sets::Logger::warn() + "tag/scan: HTTP " + String(httpResponseCode));
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, response);
+  if (error) {
+    errorServer(error.f_str());
+    return false;
+  }
+  if (doc["matched_spool_id"].isNull() || !doc["matched_spool_id"].is<int>()) return false;
+
+  matched = doc["matched_spool_id"].as<int>();
+  return matched > 0;
+}
+
+//Ключ есть и содержит ID числом либо числовой строкой
+//(у Spool Painter spool_id — число, у FilaMan sm_id — строка).
+static bool jsonHasID(JsonDocument& doc, const char* key) {
+  return doc[key].is<int>() || doc[key].is<const char*>();
+}
+
+//Десериализация payload метки с детектом формата:
+//openspool (protocol=="openspool" + spool_id; либо характерный набор ключей) или FilaMan legacy (sm_id).
+//true — payload разобран и формат распознан; doc остаётся валидным для чтения полей.
+bool parseTagJSON(const String& payload, JsonDocument& doc) {
+  doc.clear();
+  if (!payload.length()) return false;
+
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.print("Ошибка расшифровки JSON: ");
+    Serial.println(error.c_str());
+    logger.print(sets::Logger::error() + "Ошибка расшифровки JSON: ");
+    logger.println(error.c_str());
+    return false;
+  }
+
+  //openspool (в т.ч. расширение spool_id от Spool Painter)
+  if (doc["protocol"] == "openspool" && jsonHasID(doc, "spool_id")) return true;
+  //FilaMan legacy
+  if (jsonHasID(doc, "sm_id")) return true;
+  //openspool без protocol, но с характерными строковыми ключами формата
+  if (jsonHasID(doc, "spool_id") && (doc["brand"].is<const char*>() || doc["color_hex"].is<const char*>() || doc["type"].is<const char*>())) return true;
+  return false;
+}
+
+//ID катушки из разобранного JSON: сперва spool_id (openspool), затем sm_id (FilaMan). -1 — нет.
+static int tagSpoolID(JsonDocument& doc) {
+  if (doc["spool_id"].is<int>()) return doc["spool_id"].as<int>();
+  if (doc["spool_id"].is<const char*>()) return atoi(doc["spool_id"].as<const char*>());
+  if (doc["sm_id"].is<int>()) return doc["sm_id"].as<int>();
+  if (doc["sm_id"].is<const char*>()) return atoi(doc["sm_id"].as<const char*>());
+  return -1;
+}
+
 void readNFC() {
   if (!mfrc522.PICC_IsNewCardPresent()) {
     lastUID = 0;
@@ -513,6 +738,7 @@ void readNFC() {
     return;
   }
 
+  //Дедуп по uint32-хешу UID: полный UID нужен только для HTTP
   uint32_t uidHash = 0;
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     uidHash = (uidHash << 8) | mfrc522.uid.uidByte[i];
@@ -523,61 +749,55 @@ void readNFC() {
   }
   lastUID = uidHash;
 
-  MFRC522::StatusCode status;
-  byte byteCount;
-  uint8_t buffer[60];
-  String payload, payload_data;
+  String uid = formatUID();
+  Serial.print("Метка UID: ");
+  Serial.println(uid);
 
-  for (byte page = 8; page <= 60; page += 4) {
-    byteCount = 18;
-    status = mfrc522.MIFARE_Read(page, buffer, &byteCount);
-    if (status != MFRC522::StatusCode::STATUS_OK) {
-      Serial.println(F("Ошибка чтения метки"));
-      logger.println(sets::Logger::error() + "Ошибка чтения метки");
-      set_led_color(RED);
-      return;
-    }
-    for (byte offset = 0; offset < 4; offset++) {
-      for (byte index = 0; index < 4; index++) {
-        payload_data += char(buffer[4 * offset + index]);
-      }
-    }
-    if (page == 60) break;
+  //Содержимое метки читаем всегда: из него заполняются поля nfc_* (ID/тип/бренд/цвет)
+  String payload = ndefPayload();
+  JsonDocument doc;
+  int tagID = -1;
+  if (parseTagJSON(payload, doc)) {
+    tagID = tagSpoolID(doc);
+    db[web::nfc_id] = tagID > 0 ? tagID : 0;
+    db[web::nfc_name] = doc["type"] | "";
+    db[web::nfc_brand] = doc["brand"] | "";
+    db[web::nfc_color] = doc["color_hex"] | "";
+    sett.reload();
+    Serial.println("Прочитана метка с ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
+    logger.println("Прочитана метка с ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
   }
 
-  for (int i = 5; i < payload_data.length(); i++) {
-    payload += payload_data[i];
-  }
-  Serial.print("payload: ");
-  Serial.println(payload);
   mfrc522.PICC_HaltA();
 
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    Serial.print("Ошибка расшифровки JSON: ");
-    Serial.println(error.c_str());
-    logger.print(sets::Logger::error() + "Ошибка расшифровки JSON: ");
-    logger.println(error.c_str());
-    set_led_color(RED);
+  //1) UID-first: линковка UID -> катушка в Spoolman имеет приоритет над содержимым метки (D2)
+  int matched = -1;
+  if (spoolIDByUID(uid, matched)) {
+    Serial.println("Метка привязана к катушке ID:" + String(matched));
+    logger.println("Метка " + uid + " привязана к катушке ID:" + String(matched));
+    set_led_color(YELLOW);
+    SetSpool(matched);
+    if (mmu == true) {
+      mmu_next_spoolid(matched);
+    }
     return;
   }
-  set_led_color(YELLOW);
 
-  const char* sm_id = doc["sm_id"] | "";
-  const char* color_hex = doc["color_hex"] | "";
-  const char* type = doc["type"] | "";
-  const char* brand = doc["brand"] | "";
-
-  db[web::nfc_id] = atoi(sm_id);
-  db[web::nfc_name] = type;
-  db[web::nfc_brand] = brand;
-  db[web::nfc_color] = color_hex;
-  Serial.println("Прочитана метка с ID:" + String(sm_id) + " Тип:" + String(type));
-  logger.println("Прочитана метка с ID:" + String(sm_id) + " Тип:" + String(type));
-
-  SetSpool(atoi(sm_id));
-  if (mmu == true) {
-    mmu_next_spoolid(atoi(sm_id));
+  //2) Fallback: содержимое метки — openspool spool_id, затем FilaMan sm_id (D3)
+  if (tagID > 0) {
+    Serial.println("Установка катушки по содержимому метки ID:" + String(tagID));
+    logger.println("Установка катушки по содержимому метки ID:" + String(tagID));
+    set_led_color(YELLOW);
+    SetSpool(tagID);
+    if (mmu == true) {
+      mmu_next_spoolid(tagID);
+    }
+    return;
   }
+
+  //3) Ни UID-линковки, ни распознанного формата
+  Serial.print("Метка не распознана, payload: ");
+  Serial.println(payload);
+  logger.println(sets::Logger::error() + "Метка " + uid + " не распознана (нет линковки и NDEF-формата)");
+  set_led_color(RED);
 }

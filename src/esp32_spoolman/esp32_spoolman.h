@@ -9,8 +9,11 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.2"
+#define VER "1.3"
 #define SW_WIFI 6
+
+//Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
+#define READER_ID "esp32-to-spoolman"
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -102,3 +105,9 @@ bool getIDSpool(int ID);
 void SetSpool(int SetID);
 void mmu_next_spoolid(int SetID);
 void readNFC();
+
+//Чтение метки v1.3: UID-first + NDEF TLV-парсер + диспетчер форматов
+String formatUID();                                          //полный UID hex UPPERCASE (04CA7EAF732681)
+String ndefPayload();                                        //payload NDEF-записи («» если TLV/запись не распарсились)
+bool spoolIDByUID(const String& uid, int& matched);           //POST /api/v1/tag/scan; true если matched_spool_id — число
+bool parseTagJSON(const String& payload, JsonDocument& doc);  //openspool (protocol/spool_id) либо FilaMan (sm_id)
