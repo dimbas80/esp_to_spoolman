@@ -97,6 +97,18 @@ extern uint32_t lastUID;
 extern bool writeMode;
 //Максимум опций в списке катушек (Select): больше — усечение + лог
 #define N_OPT_MAX 60
+
+//Машина записи v1.3 (D16): IDLE — ничего не ждём; WAIT_TAG — ждём метку после кнопки;
+//WRITING/ERASING — идёт запись/стирание.
+enum WriteState { IDLE, WAIT_TAG, WRITING, ERASING };
+extern WriteState wstate;
+//Таймаут ожидания метки после нажатия кнопки (D16)
+#define WRITE_TAG_TIMEOUT 60000
+//Состояние конфликта 409 (D13): UID, по которому уже сообщили владельца, и спул-владелец.
+//Повторное нажатие «Записать» на том же UID = подтверждение перелинковки.
+extern String conflictUID;
+extern int conflictSpool;
+extern unsigned long writeStart;  //millis() начала ожидания метки
 extern unsigned long lastSpoolmanFail;
 extern unsigned long lastMoonrakerFail;
 extern bool prevSpoolmanOk;   //предыдущее состояние Spoolman (для лога изменений)
@@ -106,6 +118,7 @@ extern bool prevMoonrakerOk;  //предыдущее состояние Moonrake
 extern TimerMs T_LED_WIFI;
 extern TimerMs ResetLED;
 extern TimerMs WatchdogNFC;
+extern TimerMs T_LED_WRITE;  //мигание «ждём метку» (250 мс, D16)
 
 #define RETRY_DELAY 30000  //Пауза между повторными попытками HTTP (мс)
 
@@ -131,3 +144,11 @@ bool parseTagJSON(const String& payload, JsonDocument& doc);  //openspool (proto
 //Режим записи v1.3: список катушек для Select и id выбранной катушки
 bool fetchSpoolList(bool noTagOnly);  //GET /api/v1/spool?allow_archived=false -> spool_opts + spool_ids
 int selectedSpoolID();               //id из spool_ids по индексу spool_sel; -1 если ничего не выбрано
+
+//Запись метки v1.3 (D5–D9, D13–D16)
+bool tagLockCheck(bool& writable);  //lock-биты/CC/PROT до записи; writable=false при любом запрете
+bool writeNDEF(const String& payload);  //CC + TLV + запись по страницам + перечитывание для подтверждения
+bool linkTagUID(const String& uid, int spoolID, String& holderID);  //POST /spool/{id}/tag; 409 -> holderID
+bool unlinkTagUID(const String& uid, int spoolID);                  //DELETE /spool/{id}/tag/{uid} (D13/D9)
+bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp);  //GET /spool/{id} для D6
+bool writeTick();  //таймаут ожидания метки + мигание (true — LED ведёт ожидание, updateLED не нужен)

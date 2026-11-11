@@ -32,6 +32,12 @@ bool fl_led = false;
 bool mmu = false;
 bool writeMode = false;  //D10: режим записи — активация катушки/MMU/tag-scan заблокированы
 uint32_t lastUID = 0;
+//Машина записи (D16): ожидание метки после нажатия кнопки + таймаут 60 с
+WriteState wstate = IDLE;
+unsigned long writeStart = 0;
+unsigned long ledHoldUntil = 0;  //до этого момента статусный updateLED() не затирает цвет результата записи
+String conflictUID = "";  //D13: UID, по которому уже сообщили владельца (повтор = перелинковка)
+int conflictSpool = 0;    //D13: спул-владелец UID из 409
 unsigned long lastSpoolmanFail = 0;
 unsigned long lastMoonrakerFail = 0;
 bool prevSpoolmanOk = false;
@@ -40,6 +46,7 @@ bool prevMoonrakerOk = false;
 TimerMs T_LED_WIFI(500, 1, 0);
 TimerMs ResetLED(1000, 1, 0);
 TimerMs WatchdogNFC(30000, 1, 0);
+TimerMs T_LED_WRITE(250, 1, 0);
 
 //Сброс write-состояния: вызывается на ЛЮБОЙ переход таба (Review Focus 4),
 //чтобы выход из подменю не оставлял активного ожидания метки.
@@ -49,6 +56,10 @@ static void resetWriteState() {
   db[web::w_type] = "";
   db[web::w_brand] = "";
   lastUID = 0;  //метка, прочитанная до входа в режим, должна читаться заново
+  //Выход из подменю отменяет ожидание метки немедленно (D16), конфликт 409 тоже сбрасывается
+  wstate = IDLE;
+  conflictUID = "";
+  conflictSpool = 0;
 }
 
 //Интерфейс настроек
@@ -86,8 +97,23 @@ void build(sets::Builder& b) {
     }
     {
       sets::Group g(b, "Действия");
-      //Обработчики кнопок — машина записи/стирания (Task 3/4)
-      b.Button(web::btn_write, "Записать метку");
+      //«Записать метку»: катушка выбрана -> ждём метку (мигает жёлтый) -> запись по касанию (Task 3)
+      if (b.Button(web::btn_write, "Записать метку")) {
+        int spoolID = selectedSpoolID();
+        if (spoolID <= 0) {
+          Serial.println("Запись метки: катушка не выбрана");
+          logger.println(sets::Logger::error() + "Запись метки: катушка не выбрана (обновите список катушек)");
+          set_led_color(RED);
+        } else {
+          lastUID = 0;  //метка, уже лежащая на считывателе, должна прочитаться заново
+          writeStart = millis();
+          wstate = WAIT_TAG;
+          T_LED_WRITE.restart();
+          Serial.println("Запись метки: ожидание метки (катушка ID:" + String(spoolID) + ")");
+          logger.println("Запись метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с), катушка ID:" + String(spoolID));
+        }
+      }
+      //«Стереть метку» — Task 4 (стирание чипа + отвязка UID)
       b.Button(web::btn_erase, "Стереть метку", sets::Colors::Red);
     }
     {
@@ -176,6 +202,7 @@ void setup() {
   T_LED_WIFI.setPeriodMode();
   ResetLED.setPeriodMode();
   WatchdogNFC.setPeriodMode();
+  T_LED_WRITE.setPeriodMode();
   set_led_color(0);  //гасим светодиод
 
   WiFi.mode(WIFI_AP_STA);
@@ -324,8 +351,11 @@ void loop() {
 
   readNFC();
 
-  //Обновляем светодиод по состоянию системы
-  updateLED();
+  //LED: ожидание метки (мигание жёлтым) имеет приоритет над статусным обновлением (D16);
+  //результат записи (LIME/RED) держится ~1.5 с, иначе статусный цвет затирал бы его сразу же
+  if (!writeTick()) {
+    if ((int32_t)(millis() - ledHoldUntil) >= 0) updateLED();
+  }
 
   //Читаем Serial
   if (Serial.available()) {
@@ -817,6 +847,9 @@ static int tagSpoolID(JsonDocument& doc) {
   return -1;
 }
 
+//Машина записи по касанию метки в WAIT_TAG (определение — в секции «Запись метки v1.3» в конце файла)
+static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocument& tagDoc, bool parsed);
+
 void readNFC() {
   if (!mfrc522.PICC_IsNewCardPresent()) {
     lastUID = 0;
@@ -853,10 +886,18 @@ void readNFC() {
     db[web::w_uid] = uid;
     db[web::w_type] = doc["type"] | "";
     db[web::w_brand] = doc["brand"] | "";
-    mfrc522.PICC_HaltA();
-    sett.reload();
     Serial.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | "") + " (активация заблокирована)");
     logger.println("Режим записи: метка " + uid + " ID:" + String(tagID) + " Тип:" + String(doc["type"] | "") + " Бренд:" + String(doc["brand"] | ""));
+
+    //Кнопка «Записать метку» нажата — метка в поле считывателя, запускаем машину записи (D16)
+    if (wstate == WAIT_TAG) {
+      wstate = WRITING;
+      tagWriteFlow(uid, payload, doc, parsed);
+      wstate = IDLE;
+    }
+
+    mfrc522.PICC_HaltA();
+    sett.reload();
     return;
   }
 
@@ -1011,4 +1052,586 @@ int selectedSpoolID() {
     cur++;
   }
   return -1;
+}
+
+//=== Запись метки v1.3: lock-проверка, NDEF-запись, линковка (D5–D9, D13–D16) ===
+
+#define NDEF_TYPE_JSON     "application/json"  //MIME-тип NDEF-записи openspool/FilaMan
+#define NDEF_TYPE_JSON_LEN 16                  //strlen("application/json")
+
+//Служебные адреса NTAG21x (NXP NTAG213/215/216 Rev. 3.2, §8.5): наличие страницы динамических
+//lock-байтов определяет тип чипа, страницы конфигурации — AUTH0 и PROT.
+struct TagChipInfo {
+  const char* name;      //имя чипа для логов
+  uint8_t dynLockPage;   //динамические lock-байты: 28h/82h/E2h
+  uint8_t cfgPage;       //первая страница конфигурации: байт 3 — AUTH0
+  uint8_t accessPage;    //вторая страница конфигурации: байт 0, бит 7 — PROT
+  uint16_t ccSize;       //размер данных NDEF по CC (байт)
+  uint8_t ccSizeCode;    //CC байт 2 = ccSize / 8
+  uint8_t dataLastPage;  //последняя страница данных по CC
+};
+
+//Страница читается (нет NAK по несуществующему адресу) — так определяется тип чипа
+static bool tagPageReadable(byte page) {
+  uint8_t buf[18];
+  byte n = sizeof(buf);
+  return mfrc522.MIFARE_Read(page, buf, &n) == MFRC522::StatusCode::STATUS_OK;
+}
+
+//Тип чипа по наличию служебных страниц: 216 -> 226h, 215 -> 82h, 213 -> 28h
+static bool tagChipInfo(TagChipInfo& chip) {
+  static const TagChipInfo c213 = { "NTAG213", 40, 41, 42, 144, 0x12, 39 };
+  static const TagChipInfo c215 = { "NTAG215", 130, 131, 132, 496, 0x3E, 127 };
+  static const TagChipInfo c216 = { "NTAG216", 226, 227, 228, 888, 0x6E, 225 };
+  if (tagPageReadable(c216.dynLockPage)) {
+    chip = c216;
+    return true;
+  }
+  if (tagPageReadable(c215.dynLockPage)) {
+    chip = c215;
+    return true;
+  }
+  if (tagPageReadable(c213.dynLockPage)) {
+    chip = c213;
+    return true;
+  }
+  return false;
+}
+
+//Байты страницы в hex — для логов CC
+static String pageHex(const uint8_t* p, uint8_t n) {
+  String out;
+  static const char hex[] = "0123456789ABCDEF";
+  for (uint8_t i = 0; i < n; i++) {
+    if (i) out += ' ';
+    out += hex[(p[i] >> 4) & 0x0F];
+    out += hex[p[i] & 0x0F];
+  }
+  return out;
+}
+
+//Один байт в hex — для логов lock-битов
+static String byteHex(uint8_t v) {
+  static const char hex[] = "0123456789ABCDEF";
+  String out;
+  out += hex[(v >> 4) & 0x0F];
+  out += hex[v & 0x0F];
+  return out;
+}
+
+//D7: проверка запрета записи ДО любой записи в метку (статическая защита, динамическая, PROT, пароль, CC).
+//true — состояние чипа определено (writable: можно писать); false — чип не NTAG21x либо не читается.
+bool tagLockCheck(bool& writable) {
+  writable = false;
+
+  TagChipInfo chip;
+  if (!tagChipInfo(chip)) {
+    Serial.println("Метка: тип чипа не определён (не NTAG21x)");
+    logger.println(sets::Logger::error() + "Метка: тип чипа не определён (не NTAG21x), запись запрещена");
+    return false;
+  }
+
+  //Статическая защита (стр. 2, байты 2-3): Lx запирает страницу x (3..15); CC — стр. 3 из того же чтения
+  uint8_t buf[18];
+  byte n = sizeof(buf);
+  if (mfrc522.MIFARE_Read(2, buf, &n) != MFRC522::StatusCode::STATUS_OK) {
+    logger.println(sets::Logger::error() + "Метка " + String(chip.name) + ": не читается стр. 2 (lock/CC)");
+    return false;
+  }
+  uint8_t lock0 = buf[2];
+  uint8_t lock1 = buf[3];
+  bool ccLocked = (lock0 & 0x08) != 0;                //L_CC — страница 3 (CC)
+  bool staticLocked = (lock0 & 0xF0) || lock1;        //L4..L15 — страницы данных
+  bool ccValid = buf[4] == 0xE1 && buf[5] == 0x10 && buf[6] == chip.ccSizeCode && buf[7] == 0x00;
+
+  //Динамическая защита (стр. 40/130/226, байты 0-2): страницы 16h и далее
+  bool dynLocked = false;
+  n = sizeof(buf);
+  if (mfrc522.MIFARE_Read(chip.dynLockPage, buf, &n) == MFRC522::StatusCode::STATUS_OK) {
+    dynLocked = buf[0] || buf[1] || buf[2];
+  }
+
+  //AUTH0 (байт 3 первой страницы конфигурации): FFh — пароль не используется
+  uint8_t auth0 = 0xFF;
+  n = sizeof(buf);
+  bool cfgOk = mfrc522.MIFARE_Read(chip.cfgPage, buf, &n) == MFRC522::StatusCode::STATUS_OK;
+  if (cfgOk) auth0 = buf[3];
+
+  //PROT (ACCESS, байт 0, бит 7): 1 — чтение и запись только после PWD_AUTH
+  bool prot = false;
+  n = sizeof(buf);
+  bool accessOk = mfrc522.MIFARE_Read(chip.accessPage, buf, &n) == MFRC522::StatusCode::STATUS_OK;
+  if (accessOk) prot = (buf[0] & 0x80) != 0;
+
+  bool passworded = auth0 <= chip.dataLastPage;  //защита начинается внутри области данных
+
+  if (!cfgOk || !accessOk) {
+    //Страницы конфигурации не читаются: пароль/PROT проверить нельзя. Молча писать не будем —
+    //но и блокировать нельзя (запись в защищённую область всё равно вернёт NAK, порчи не будет).
+    logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + ": не читаются страницы конфигурации (AUTH0/PROT) — считаем защиту выключенной");
+  }
+
+  if (staticLocked || dynLocked) {
+    logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + " заперта (lock-биты " + byteHex(lock0) + " " + byteHex(lock1) + "), запись запрещена");
+  } else if (prot) {
+    logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + ": PROT=1 (доступ под паролем), запись запрещена");
+  } else if (passworded) {
+    logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + ": AUTH0=" + String(auth0) + " (парольная защита), запись запрещена");
+  } else if (ccLocked && !ccValid) {
+    logger.println(sets::Logger::warn() + "Метка " + String(chip.name) + ": CC заперт и не NDEF, запись запрещена");
+  }
+
+  writable = !(staticLocked || dynLocked || prot || passworded || (ccLocked && !ccValid));
+  return true;
+}
+
+//NDEF-сообщение для записи: TLV 0x03 (+ 0xFF len16 при длине > 254) + запись application/json
+//(SR при payload <= 255 байт, иначе 4-байтная длина) + Terminator 0xFE + паддинг до страницы.
+//Возвращает длину буфера (кратно 4) либо 0, если не влезает в cap.
+static uint16_t buildNdefMessage(const String& payload, uint8_t* out, uint16_t cap) {
+  uint16_t payloadLen = (uint16_t)payload.length();
+  if (payloadLen == 0) return 0;
+
+  bool shortRecord = payloadLen <= 255;
+  uint16_t msgLen = 3 + (shortRecord ? 0 : 3) + NDEF_TYPE_JSON_LEN + payloadLen;
+  bool longTlv = msgLen > 254;                  //0xFF — признак 16-битной длины TLV
+  uint16_t total = (longTlv ? 4 : 2) + msgLen + 1;  //+ Terminator
+  uint16_t padded = (uint16_t)((total + 3) & ~3);
+  if (padded > cap) return 0;
+
+  uint16_t ofs = 0;
+  if (longTlv) {
+    out[ofs++] = NDEF_TLV_NDEF;
+    out[ofs++] = NDEF_TLV_LONG;
+    out[ofs++] = (uint8_t)(msgLen >> 8);
+    out[ofs++] = (uint8_t)(msgLen & 0xFF);
+  } else {
+    out[ofs++] = NDEF_TLV_NDEF;
+    out[ofs++] = (uint8_t)msgLen;
+  }
+
+  //Заголовок записи: MB|ME|TNF=Media (0x02), SR — только если payload влезает в 1 байт длины
+  out[ofs++] = (uint8_t)(0x80 | 0x40 | (shortRecord ? 0x10 : 0x00) | 0x02);
+  out[ofs++] = (uint8_t)NDEF_TYPE_JSON_LEN;
+  if (shortRecord) {
+    out[ofs++] = (uint8_t)payloadLen;
+  } else {
+    out[ofs++] = (uint8_t)(payloadLen >> 24);
+    out[ofs++] = (uint8_t)(payloadLen >> 16);
+    out[ofs++] = (uint8_t)(payloadLen >> 8);
+    out[ofs++] = (uint8_t)(payloadLen & 0xFF);
+  }
+  memcpy(out + ofs, NDEF_TYPE_JSON, NDEF_TYPE_JSON_LEN);
+  ofs += NDEF_TYPE_JSON_LEN;
+  for (uint16_t i = 0; i < payloadLen; i++) out[ofs++] = (uint8_t)payload[i];
+  out[ofs++] = NDEF_TLV_END;
+  while (ofs < padded) out[ofs++] = 0x00;
+  return padded;
+}
+
+//D7/Review Focus 5: проверка CC (стр. 3: E1 10 <size/8> 00) + TLV + NDEF-запись по страницам + Terminator.
+//Подтверждение — перечитывание: ndefPayload() должен вернуть ровно записанное.
+bool writeNDEF(const String& payload) {
+  if (!payload.length()) {
+    logger.println(sets::Logger::error() + "Запись метки: пустой payload");
+    return false;
+  }
+
+  TagChipInfo chip;
+  if (!tagChipInfo(chip)) {
+    logger.println(sets::Logger::error() + "Запись метки: тип чипа не определён (не NTAG21x)");
+    return false;
+  }
+
+  //1) CC: без него телефон не увидит NDEF. Нестандартный CC переписываем и логируем
+  uint8_t cc[18];
+  byte n = sizeof(cc);
+  if (mfrc522.MIFARE_Read(3, cc, &n) != MFRC522::StatusCode::STATUS_OK) {
+    logger.println(sets::Logger::error() + "Запись метки " + String(chip.name) + ": не читается CC (стр. 3)");
+    return false;
+  }
+  if (cc[0] != 0xE1 || cc[1] != 0x10 || cc[2] != chip.ccSizeCode || cc[3] != 0x00) {
+    logger.println(sets::Logger::warn() + "CC метки " + String(chip.name) + " нестандартен (" + pageHex(cc, 4) + ") — переписываем на E1 10 " + pageHex(&chip.ccSizeCode, 1) + " 00");
+    uint8_t fixed[4] = { 0xE1, 0x10, chip.ccSizeCode, 0x00 };
+    if (mfrc522.MIFARE_Ultralight_Write(3, fixed, 4) != MFRC522::StatusCode::STATUS_OK) {
+      logger.println(sets::Logger::error() + "Запись метки: не удалось переписать CC (стр. 3)");
+      return false;
+    }
+  }
+
+  //2) NDEF-сообщение: TLV + запись + Terminator, паддинг до границы страницы
+  static uint8_t msg[NDEF_MAX_BYTES + 16];  //вне стека: до 904 байт
+  uint16_t len = buildNdefMessage(payload, msg, chip.ccSize);
+  if (!len) {
+    logger.println(sets::Logger::error() + "Запись метки: payload " + String(payload.length()) + " байт не влезает в " + String(chip.name) + " (CC " + String(chip.ccSize) + " байт)");
+    return false;
+  }
+
+  //3) Постраничная запись 4-байтными страницами
+  uint16_t pages = (uint16_t)(len / 4);
+  for (uint16_t i = 0; i < pages; i++) {
+    uint16_t page = (uint16_t)(NDEF_PAGE_START + i);
+    if (page > chip.dataLastPage) {
+      logger.println(sets::Logger::error() + "Запись метки: выход за границу данных " + String(chip.name) + " (стр. " + String(page) + ")");
+      return false;
+    }
+    if (mfrc522.MIFARE_Ultralight_Write((byte)page, &msg[i * 4], 4) != MFRC522::StatusCode::STATUS_OK) {
+      logger.println(sets::Logger::error() + "Запись метки: ошибка записи страницы " + String(page));
+      return false;
+    }
+  }
+
+  //4) Подтверждение перечитыванием: TLV-парсер должен вернуть ровно записанное
+  String check = ndefPayload();
+  if (check != payload) {
+    logger.println(sets::Logger::error() + "Запись метки: проверка чтением не совпала (записано " + String(payload.length()) + ", прочитано " + String(check.length()) + " байт)");
+    return false;
+  }
+  return true;
+}
+
+//D8/D13: POST /api/v1/spool/{id}/tag {"uid":...,"format":"ntag"}.
+//true — UID привязан. false: holderID — "<id>" спула-владельца (409, возможна перелинковка),
+//"F<id>" — владелец филамент (через API спулов не перецепляется), "" — иная ошибка (залогирована).
+bool linkTagUID(const String& uid, int spoolID, String& holderID) {
+  holderID = "";
+  if (!uid.length() || spoolID <= 0) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    logger.println(sets::Logger::error() + "Линковка метки " + uid + ": нет WiFi");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool/" + String(spoolID) + "/tag";
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument request;
+  request["uid"] = uid;
+  request["format"] = "ntag";
+  String body;
+  serializeJson(request, body);
+
+  int code = http.POST(body);
+  String response;
+  if (code > 0) response = http.getString();
+  http.end();
+
+  if (code == 200 || code == 201) return true;
+
+  if (code == 409) {
+    //Тело 409: {"message":..., "spool_id":X|null, "filament_id":Y|null} — владелец метки
+    JsonDocument doc;
+    if (!deserializeJson(doc, response)) {
+      int holder = doc["spool_id"] | -1;
+      if (holder > 0) {
+        holderID = String(holder);
+      } else if (!doc["filament_id"].isNull()) {
+        holderID = "F" + String((int)(doc["filament_id"] | 0));
+      }
+    }
+    Serial.println("Линковка метки " + uid + ": HTTP 409, владелец " + holderID);
+    logger.println(sets::Logger::warn() + "Линковка метки " + uid + ": UID уже привязан (" + holderID + ")");
+    return false;
+  }
+
+  Serial.println("Линковка метки " + uid + ": HTTP " + String(code));
+  if (code <= 0) {
+    errorServer(String(code));
+    lastSpoolmanFail = millis();
+  } else {
+    logger.println(sets::Logger::error() + "Линковка метки " + uid + ": HTTP " + String(code));
+  }
+  return false;
+}
+
+//D13/D9: DELETE /api/v1/spool/{id}/tag/{uid}. 204 — отвязано; 404 — такой линковки нет.
+bool unlinkTagUID(const String& uid, int spoolID) {
+  if (!uid.length() || spoolID <= 0) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    logger.println(sets::Logger::error() + "Отвязка метки " + uid + ": нет WiFi");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool/" + String(spoolID) + "/tag/" + uid;
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.sendRequest("DELETE");  //в HTTPClient ESP32 нет метода DELETE()
+  http.end();
+
+  if (code == 200 || code == 204) return true;
+  if (code == 404) {
+    logger.println(sets::Logger::warn() + "Отвязка метки " + uid + ": линковки на ID:" + String(spoolID) + " нет (404)");
+    return false;
+  }
+  Serial.println("Отвязка метки " + uid + ": HTTP " + String(code));
+  if (code <= 0) {
+    errorServer(String(code));
+    lastSpoolmanFail = millis();
+  } else {
+    logger.println(sets::Logger::error() + "Отвязка метки " + uid + ": HTTP " + String(code));
+  }
+  return false;
+}
+
+//Число из JSON метки/ответа Spoolman: целое либо дробное (в API встречаются оба вида).
+//ArduinoJson::is<int>() не считает 240.0 целым, поэтому читаем и float.
+static int jsonInt(JsonVariantConst v, int def) {
+  if (v.is<int>()) return v.as<int>();
+  if (v.is<float>()) return (int)(v.as<float>() + 0.5f);
+  return def;
+}
+
+//D6: данные катушки из Spoolman (GET /api/v1/spool/{id}) для сборки openspool-JSON
+bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp) {
+  material = "";
+  brand = "";
+  colorHex = "";
+  extruderTemp = 0;
+  bedTemp = 0;
+  if (spoolID <= 0) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    logger.println(sets::Logger::error() + "Запись метки: нет WiFi (данные катушки не получены)");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool/" + String(spoolID);
+  http.begin(url);
+  http.setTimeout(1500);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  String response;
+  if (code > 0) response = http.getString();
+  http.end();
+
+  if (code != 200) {
+    Serial.println("Катушка ID:" + String(spoolID) + ": HTTP " + String(code));
+    logger.println(sets::Logger::error() + "Запись метки: катушка ID:" + String(spoolID) + " не получена (HTTP " + String(code) + ")");
+    if (code <= 0) lastSpoolmanFail = millis();
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, response);
+  if (error) {
+    errorServer(error.f_str());
+    return false;
+  }
+  material = doc["filament"]["material"] | "";
+  brand = doc["filament"]["vendor"]["name"] | "";
+  colorHex = doc["filament"]["color_hex"] | "";
+  extruderTemp = jsonInt(doc["filament"]["settings_extruder_temp"], 0);
+  bedTemp = jsonInt(doc["filament"]["settings_bed_temp"], 0);
+  return true;
+}
+
+//D6: openspool-JSON из данных Spoolman. Значения — строки, как в эталонной метке Spool Painter
+//(nfc_spoolpainter.md: "min_temp":"220", "spool_id":"37"); bed_min_temp/bed_max_temp — ключи
+//расширения openspool, которыми пишет Spool Painter (в D6 они названы bed_min/bed_max).
+static String buildOpenspoolJSON(int spoolID, const String& material, const String& brand, const String& colorHex, int extruderTemp, int bedTemp) {
+  JsonDocument doc;
+  doc["protocol"] = "openspool";
+  doc["version"] = "1.0";
+  if (material.length()) doc["type"] = material;
+  if (colorHex.length()) doc["color_hex"] = colorHex;
+  if (brand.length()) doc["brand"] = brand;
+  if (extruderTemp > 0) {
+    doc["min_temp"] = String(extruderTemp);
+    doc["max_temp"] = String(extruderTemp);
+  } else {
+    logger.println(sets::Logger::warn() + "Запись метки: settings_extruder_temp не задан — температуры сопла не пишем");
+  }
+  if (bedTemp > 0) {
+    doc["bed_min_temp"] = String(bedTemp);
+    doc["bed_max_temp"] = String(bedTemp);
+  } else {
+    logger.println(sets::Logger::warn() + "Запись метки: settings_bed_temp не задан — температуры стола не пишем");
+  }
+  doc["spool_id"] = String(spoolID);
+  doc["subtype"] = "Basic";
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+//D5/Review Focus 2: в вендорский JSON дописываем ТОЛЬКО spool_id; re-serialize через ArduinoJson
+//сохраняет все ключи вендора (температуры и subtype не трогаем).
+static String augmentVendorJSON(JsonDocument& doc, int spoolID) {
+  doc["spool_id"] = String(spoolID);
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+//Формат содержимого метки: 0 — пусто/не распознано (пишем openspool из Spoolman, D6),
+//1 — вендорский/openspool (дописываем spool_id, D5), 2 — FilaMan legacy (полная замена, D15).
+static int tagPayloadFormat(JsonDocument& doc, bool parsed) {
+  if (!parsed) return 0;
+  if (doc["protocol"].is<const char*>()) return 1;
+  if (jsonHasID(doc, "sm_id")) return 2;
+  if (doc["type"].is<const char*>() || jsonHasID(doc, "spool_id")) return 1;
+  return 0;
+}
+
+//Цвет результата записи (LIME/RED) держится ~1.5 с: иначе статусный updateLED() в том же
+//проходе loop() сразу затрёт его (см. ledHoldUntil в loop()).
+#define LED_HOLD_MS 1500
+
+static void setWriteResult(uint32_t color) {
+  set_led_color(color);
+  ledHoldUntil = millis() + LED_HOLD_MS;
+}
+
+//D8/D13: линковка с двухшаговым подтверждением конфликта. true — UID привязан к spoolID.
+static bool linkWithConflict(const String& uid, int spoolID) {
+  String holder;
+  if (linkTagUID(uid, spoolID, holder)) {
+    conflictUID = "";
+    conflictSpool = 0;
+    Serial.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
+    logger.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
+    return true;
+  }
+  if (!holder.length()) return false;  //не 409 либо владелец без id — уже залогировано
+
+  if (holder[0] == 'F') {
+    logger.println(sets::Logger::error() + "Метка " + uid + " привязана к филаменту ID:" + holder.substring(1) + " — перелинковка вручную");
+    return false;
+  }
+
+  int holderSpool = holder.toInt();
+  if (conflictUID != uid) {
+    //Первое нажатие: только сообщаем владельца, ничего не удаляем
+    conflictUID = uid;
+    conflictSpool = holderSpool;
+    Serial.println("Метка " + uid + " уже привязана к ID:" + String(holderSpool));
+    logger.println(sets::Logger::warn() + "UID уже привязан к ID " + String(holderSpool) + ", нажмите Записать ещё раз для перелинковки");
+    return false;
+  }
+
+  //Второе нажатие на том же UID — подтверждённая перелинковка: DELETE у старого владельца + POST
+  if (!unlinkTagUID(uid, holderSpool)) {
+    logger.println(sets::Logger::error() + "Перелинковка " + String(holderSpool) + "→" + String(spoolID) + " не выполнена: отвязка не удалась");
+    return false;
+  }
+  String holder2;
+  if (!linkTagUID(uid, spoolID, holder2)) {
+    logger.println(sets::Logger::error() + "Перелинковка " + String(holderSpool) + "→" + String(spoolID) + " не выполнена: повторная привязка не удалась");
+    return false;
+  }
+  conflictUID = "";
+  conflictSpool = 0;
+  Serial.println("Метка " + uid + " переехала " + String(holderSpool) + "→" + String(spoolID));
+  logger.println("метка переехала " + String(holderSpool) + "→" + String(spoolID));
+  return true;
+}
+
+//Step 2 плана: машина записи по касанию метки в WAIT_TAG (D5–D8, D13–D16).
+//Порядок: payload (D5/D6/D15) -> lock (D7; D14 — только линковка) -> запись -> подтверждение -> линковка.
+static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocument& tagDoc, bool parsed) {
+  int spoolID = selectedSpoolID();
+  if (spoolID <= 0) {
+    Serial.println("Запись метки: катушка не выбрана");
+    logger.println(sets::Logger::error() + "Запись метки: катушка не выбрана (обновите список катушек)");
+    setWriteResult(RED);
+    return;
+  }
+  logger.println("Запись метки " + uid + " -> катушка ID:" + String(spoolID));
+
+  //1) D7/D14: сначала lock-проверка (как в спецификации: UID + lock -> потом payload).
+  //Запертая либо неопознанная метка — содержимое не пишем, UID линкуем.
+  bool writable = false;
+  bool chipOk = tagLockCheck(writable);
+  if (!chipOk || !writable) {
+    String what = chipOk ? String("read-only (lock-биты), содержимое не записано") : String("не записана (чип не опознан)");
+    if (linkWithConflict(uid, spoolID)) {
+      Serial.println("Метка " + uid + " " + what + ", UID привязан к ID:" + String(spoolID));
+      logger.println(sets::Logger::warn() + "Метка " + uid + " " + what + ", UID привязан к ID:" + String(spoolID));
+      setWriteResult(LIME);
+    } else {
+      setWriteResult(RED);
+    }
+    return;  //поля w_* уже отражают фактическое содержимое метки (её не меняли)
+  }
+
+  //2) Что пишем: вендорский JSON + spool_id (D5), FilaMan — полная замена (D15), пусто — из Spoolman (D6)
+  int fmt = tagPayloadFormat(tagDoc, parsed);
+  String payloadOut;
+  if (fmt == 1) {
+    payloadOut = augmentVendorJSON(tagDoc, spoolID);
+    if (!payloadOut.length()) {
+      logger.println(sets::Logger::error() + "Запись метки: не удалось пересобрать вендорский JSON");
+      setWriteResult(RED);
+      return;
+    }
+    Serial.println("Вендорская метка: дописан spool_id=" + String(spoolID) + ", ключи сохранены");
+    logger.println("Вендорская метка: дописан spool_id=" + String(spoolID) + ", остальные ключи сохранены");
+  } else {
+    String material, brand, colorHex;
+    int extruderTemp = 0, bedTemp = 0;
+    if (!readSpoolForTag(spoolID, material, brand, colorHex, extruderTemp, bedTemp)) {
+      setWriteResult(RED);
+      return;
+    }
+    payloadOut = buildOpenspoolJSON(spoolID, material, brand, colorHex, extruderTemp, bedTemp);
+    if (fmt == 2) {
+      Serial.println("FilaMan-метка: полная перезапись в openspool+spool_id");
+      logger.println("FilaMan-метка (sm_id): полная перезапись в openspool+spool_id");
+    } else {
+      Serial.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman");
+      logger.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman ID:" + String(spoolID));
+      if (payloadIn.length()) logger.println(sets::Logger::warn() + "Содержимое метки не распознано и будет перезаписано: " + payloadIn);
+    }
+  }
+
+  //3) Запись + подтверждение перечитыванием
+  if (!writeNDEF(payloadOut)) {
+    Serial.println("Запись метки " + uid + " не удалась");
+    logger.println(sets::Logger::error() + "Запись метки " + uid + " не удалась, причина в логах выше");
+    setWriteResult(RED);
+    return;
+  }
+  Serial.println("Метка " + uid + " записана: " + String(payloadOut.length()) + " байт");
+  logger.println("Метка " + uid + " записана: " + String(payloadOut.length()) + " байт");
+
+  //4) D8: авто-линковка; ошибка линковки не отменяет запись
+  bool linked = linkWithConflict(uid, spoolID);
+
+  //Поля показывают то, что теперь лежит на метке
+  JsonDocument post;
+  if (parseTagJSON(payloadOut, post)) {
+    int tagID = tagSpoolID(post);
+    db[web::w_id] = tagID > 0 ? tagID : spoolID;
+    db[web::w_type] = post["type"] | "";
+    db[web::w_brand] = post["brand"] | "";
+  } else {
+    db[web::w_id] = spoolID;
+  }
+
+  setWriteResult(linked ? LIME : RED);
+}
+
+//D16: тик ожидания метки — таймаут 60 с и мигание жёлтым (приоритет над статусным LED).
+//true — LED в этом тике ведёт ожидание метки, статусный updateLED() вызывать не нужно.
+bool writeTick() {
+  T_LED_WRITE.tick();
+
+  if (wstate != IDLE && !writeMode) wstate = IDLE;  //вышли из подменю — ожидание не продолжается
+
+  if (wstate == WAIT_TAG && millis() - writeStart > WRITE_TAG_TIMEOUT) {
+    wstate = IDLE;
+    Serial.println("Запись метки: таймаут ожидания, отменено");
+    logger.println(sets::Logger::warn() + "Запись метки: метка не приложена за " + String(WRITE_TAG_TIMEOUT / 1000) + " с, отменено");
+  }
+
+  if (wstate != WAIT_TAG) return false;
+  if (T_LED_WRITE.ready()) set_led_color(YELLOW);
+  else set_led_color(0);
+  return true;
 }
