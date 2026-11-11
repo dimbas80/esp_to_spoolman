@@ -1,5 +1,6 @@
 // esp32_spoolman.cpp — все глобальные переменные и тела функций
 #include "esp32_spoolman.h"
+#include "spool_format.h"  //D24: палитра имён цветов и санитизация подписи опции (host-тестируемо)
 #include <Adafruit_NeoPixel.h>
 
 //Управление WS2812 через NeoPixel (62% flash, 2MB partition — хватает)
@@ -80,42 +81,16 @@ static void resetWriteState() {
   conflictSpool = 0;
 }
 
-//Интерфейс (D18): корень build() — главная страница, два подменю — «Записать метку» и
-//«Настройки». Tabs не используются: переключение меню мгновенное, а build() вызывается
-//библиотекой и при входе в меню (Build::Type::Menu + b.enterMenu() нужного блока).
+//Интерфейс (D18, порядок — D26): корень build() — два подменю («Записать метку», «Настройки») и
+//главная страница. Меню объявляются ПЕРВЫМИ: навигация вебморды строится в порядке объявления, а
+//«Записать метку» — основной сценарий, он должен стоять выше индикаторов доступности (D26).
+//Tabs не используются: переключение меню мгновенное, а build() вызывается библиотекой и при
+//входе в меню (Build::Type::Menu + b.enterMenu() нужного блока). Главная страница — код build()
+//вне меню, после endMenu() настроек.
 void build(sets::Builder& b) {
   const bool menuAction = (b.build.type == sets::Build::Type::Menu);
   bool enteredWrite = false;
   bool enteredSettings = false;
-
-  //==== Главная страница: доступность сервисов и считывателя, катушка, метка, логгер ====
-  {
-    sets::Group g(b, "Доступность");
-    b.LED(web::led_mn, "Статус Moonraker", LED_MN, sets::Colors::Yellow, sets::Colors::Green);
-    b.LED(web::led_sp, "Статус Spoolman", LED_SP, sets::Colors::Yellow, sets::Colors::Green);
-    b.LED(web::led_nfc, "NFC считыватель", LED_NFC, sets::Colors::Yellow, sets::Colors::Green);
-    //Проверка доступности: loop() по флагу дёргает statusServer() + curent_filament_name()
-    if (b.Button(web::apply2, "Проверка доступности")) {
-      fl_status = true;
-    }
-  }
-  {
-    sets::Group g(b, "Текущая катушка установленная в SpoolMan");
-    b.Label(web::id, "ID:");
-    b.Label(web::filament, "Имя:");
-  }
-  {
-    sets::Group g(b, "NFC Метка");
-    b.Label(web::nfc_id, "ID:");
-    b.Label(web::nfc_uid, "UID:");
-    b.Label(web::nfc_name, "Материал:");
-    b.Label(web::nfc_brand, "Производитель:");
-    b.Label(web::nfc_color, "Цвет:");
-  }
-  {
-    sets::Group g(b, "Логгер");
-    b.Log(H(log), logger);
-  }
 
   //==== Подменю «Записать метку» (D10: только чтение метки, активация заблокирована) ====
   //beginMenu/endMenu парные: первый виджет внутри меню попадает на отдельную страницу вебморды
@@ -171,6 +146,13 @@ void build(sets::Builder& b) {
         logger.println("Стирание метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
       }
     }
+    {
+      //D26: логгер повторяем внутри меню записи — результат записи/стирания виден там же, где
+      //нажимали кнопку, не уходя на главную. b.Log — обычный виджет, вызывается с тем же
+      //буфером (logger) и тем же ключом: страницы разные, поэтому id не конфликтуют.
+      sets::Group g(b, "Логгер");
+      b.Log(H(log), logger);
+    }
     b.endMenu();
   }
 
@@ -210,6 +192,35 @@ void build(sets::Builder& b) {
       b.Label("Версия прошивки:", VER);
     }
     b.endMenu();
+  }
+
+  //==== Главная страница (D26: код вне меню, поэтому идёт после endMenu() настроек) ====
+  {
+    sets::Group g(b, "Доступность");
+    b.LED(web::led_mn, "Статус Moonraker", LED_MN, sets::Colors::Yellow, sets::Colors::Green);
+    b.LED(web::led_sp, "Статус Spoolman", LED_SP, sets::Colors::Yellow, sets::Colors::Green);
+    b.LED(web::led_nfc, "NFC считыватель", LED_NFC, sets::Colors::Yellow, sets::Colors::Green);
+    //Проверка доступности: loop() по флагу дёргает statusServer() + curent_filament_name()
+    if (b.Button(web::apply2, "Проверка доступности")) {
+      fl_status = true;
+    }
+  }
+  {
+    sets::Group g(b, "Текущая катушка установленная в SpoolMan");
+    b.Label(web::id, "ID:");
+    b.Label(web::filament, "Имя:");
+  }
+  {
+    sets::Group g(b, "NFC Метка");
+    b.Label(web::nfc_id, "ID:");
+    b.Label(web::nfc_uid, "UID:");
+    b.Label(web::nfc_name, "Материал:");
+    b.Label(web::nfc_brand, "Производитель:");
+    b.Label(web::nfc_color, "Цвет:");
+  }
+  {
+    sets::Group g(b, "Логгер");
+    b.Log(H(log), logger);
   }
 
   //==== Смена страницы (D18) ====
@@ -849,6 +860,9 @@ struct NfcDiag {
   uint8_t probePage[3];   //страницы проб tagChipInfo: 226 -> 130 -> 40
   uint8_t probeStatus[3];
   uint8_t probeCnt;
+  uint8_t reselectCnt;    //D23: сколько раз восстанавливали выбор карты после отказа чтения
+  uint8_t reselectFail;   //из них неудачных (WUPA/SELECT не прошли — карта ушла из поля)
+  uint8_t reselectStatus; //статус последней неудачной WUPA
 };
 static NfcDiag nfcDiag;
 static String nfcDiagLoggedUID;  //UID, для которого диагностика уже напечатана
@@ -875,6 +889,17 @@ static void nfcDiagProbe(uint8_t page, uint8_t status) {
     nfcDiag.probeCnt++;
   }
   if (status != (uint8_t)MFRC522::StatusCode::STATUS_OK) nfcDiag.triggered = true;
+}
+
+//D23: переселекция карты после отказа чтения (HALT -> WUPA -> SELECT). Фиксируем сам факт и
+//исход: на NTAG215 проба 226 ожидаемо даёт NAK, и переселекция — нормальный шаг чтения,
+//а не отказ. Отказ переселекции = карта ушла из поля, обмен дальше невозможен.
+static void nfcDiagNoteReselect(bool selected, uint8_t wakeupStatus) {
+  if (nfcDiag.reselectCnt < 0xFF) nfcDiag.reselectCnt++;
+  if (selected) return;
+  nfcDiag.triggered = true;
+  nfcDiag.reselectFail++;
+  nfcDiag.reselectStatus = wakeupStatus;
 }
 
 //Определение — в секции «Запись метки v1.3»: нужны tagChipInfo()/pageHex()
@@ -1100,21 +1125,13 @@ void readNFC() {
 //пустая опция отбрасывается. Индекс результата ГЛОБАЛЬНЫЙ по всем опциям всех групп
 //(счётчик идёт сквозь группы), заголовки групп индексов не занимают — поэтому spool_ids
 //строится по флэт-списку опций.
-//Отсюда санитизация данных катушки: '['/']' сломали бы разбор групп (и сдвинули индексы),
-//';'/'\n' добавили бы лишнюю опцию, ведущий '~' спрятал бы опцию, а '~' в заголовке — всю группу.
+//D24 (v1.3.2): санитизация данных катушки вынесена в spoolfmt::sanitizeOptionText()
+//(заголовок spool_format.h — чистый C++, чтобы правило тестировалось на хосте).
+//'['/']' сломали бы разбор групп (и сдвинули индексы), ';'/'\n' добавили бы лишнюю опцию,
+//ведущий '~' спрятал бы опцию, а '~' в заголовке — всю группу.
 static String spoolTextPart(const char* raw) {
   String s = raw ? raw : "";
-  char* p = s.begin();
-  for (unsigned int i = 0; i < s.length(); i++) {
-    switch (p[i]) {
-      case ';': p[i] = ','; break;
-      case '\n':
-      case '\r': p[i] = ' '; break;
-      case '[': p[i] = '('; break;
-      case ']': p[i] = ')'; break;
-      case '~': p[i] = '-'; break;
-    }
-  }
+  spoolfmt::sanitizeOptionText(s.begin());
   s.trim();
   return s;
 }
@@ -1144,23 +1161,28 @@ static String spoolGroupTitle(JsonObjectConst sp) {
   return title;
 }
 
-//Подпись опции внутри группы: «бренд · цвет · ID» (материал уже в заголовке группы);
-//пустые части опускаем, ID показываем всегда
+//Подпись опции (D24 v1.3.2): «ID 37 · бренд · имя цвета». Материал — в заголовке группы,
+//ID первым: по нему владелец сверяет опцию с катушкой в Spoolman. В Spoolman имени цвета нет,
+//только color_hex, поэтому цвет — имя ближайшего цвета фиксированной палитры
+//(spoolfmt::colorNameForHex). Hex не разобран — показываем сам hex (подпись не врёт молчанием),
+//пусто — часть опускаем. Санитизация прежняя (spoolTextPart), через неё идёт и имя цвета.
 static String spoolOptionLabel(JsonObjectConst sp) {
-  const char* parts[] = {
-    sp["filament"]["vendor"]["name"] | "",
-    sp["filament"]["color_hex"] | "",
-  };
-  String label;
-  for (const char* raw : parts) {
-    String part = spoolTextPart(raw);
-    if (!part.length()) continue;
-    if (label.length()) label += " · ";
-    label += part;
-  }
-  if (label.length()) label += " · ";
-  label += "ID:";
+  String label = "ID ";
   label += String(spoolId(sp));
+
+  String brand = spoolTextPart(sp["filament"]["vendor"]["name"] | "");
+  if (brand.length()) {
+    label += " · ";
+    label += brand;
+  }
+
+  const char* colorHex = sp["filament"]["color_hex"] | "";
+  const char* colorName = spoolfmt::colorNameForHex(colorHex);
+  String color = spoolTextPart(colorName ? colorName : colorHex);
+  if (color.length()) {
+    label += " · ";
+    label += color;
+  }
   return label;
 }
 
@@ -1312,14 +1334,38 @@ struct TagChipInfo {
   uint8_t dataLastPage;  //последняя страница данных по CC
 };
 
+//D23: переселекция карты после неудачного обмена (HALT -> WUPA -> SELECT). После короткого
+//4-битного ответа (NAK) PCD теряет следующий длинный 16-байтовый ответ: MIFARE_Read уходит в
+//STATUS_TIMEOUT (диагностика владельца: 226=0xFF(NAK), 130/40=0x03(TIMEOUT), CC читается только
+//после переселекции). WUPA/SELECT возвращают карту в ACTIVE, и следующий обмен снова проходит.
+//Исход уходит в диагностику (nfcDiagNoteReselect). false — карта в поле не выбирается:
+//продолжать обмен бессмысленно, вызывающий код считает чтение неуспешным.
+//Внутри nfcDiagLogOnce та же пара вызовов оставлена на месте: там она — часть самой диагностики
+//(печатает ATQA и статус WUPA), а не восстановление после отказа, и в счётчик не попадает.
+static bool tagReselect() {
+  uint8_t atqa[2] = { 0, 0 };
+  byte atqaSize = sizeof(atqa);
+  mfrc522.PICC_HaltA();
+  MFRC522::StatusCode wakeup = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+  bool selected = wakeup == MFRC522::StatusCode::STATUS_OK && mfrc522.PICC_ReadCardSerial();
+  nfcDiagNoteReselect(selected, (uint8_t)wakeup);
+  return selected;
+}
+
 //Страница читается (нет NAK по несуществующему адресу) — так определяется тип чипа.
 //D22: статус каждой пробы уходит в диагностику (один лог на UID).
+//D23: после отказа (NAK — это и есть ответ на несуществующую страницу) карта переселектируется,
+//иначе NAK от пробы 226 убивал бы следующие чтения 130/40. Возвращается ИСХОДНЫЙ статус: успешная
+//переселекция не делает несуществующую страницу читаемой.
 static bool tagPageReadable(byte page) {
   uint8_t buf[18];
   byte n = sizeof(buf);
   MFRC522::StatusCode status = mfrc522.MIFARE_Read(page, buf, &n);
+  bool ok = status == MFRC522::StatusCode::STATUS_OK;
   nfcDiagProbe((uint8_t)page, (uint8_t)status);
-  return status == MFRC522::StatusCode::STATUS_OK;
+  if (ok) return true;
+  tagReselect();
+  return false;
 }
 
 //Тип чипа по наличию служебных страниц: 216 -> 226h, 215 -> 82h, 213 -> 28h
@@ -1373,6 +1419,12 @@ static void nfcDiagLogOnce(const String& uid) {
   if (nfcDiagLoggedUID == uid) return;              //анти-спам: один лог на UID
   nfcDiagLoggedUID = uid;
 
+  //D23: счётчик переселекций снимаем ДО собственных проб диагностики — в логе должны быть
+  //восстановления пути чтения (tagPageReadable), а не те, что делает сама диагностика ниже.
+  uint8_t reselectCnt = nfcDiag.reselectCnt;
+  uint8_t reselectFail = nfcDiag.reselectFail;
+  uint8_t reselectStatus = nfcDiag.reselectStatus;
+
   uint8_t sak = mfrc522.uid.sak;
   uint8_t atqa[2] = { 0, 0 };
   byte atqaSize = sizeof(atqa);
@@ -1424,6 +1476,20 @@ static void nfcDiagLogOnce(const String& uid) {
     line += byteHex(nfcDiag.firstErrStatus);
   } else {
     line += "нет (только пробы типа)";
+  }
+
+  line += " | переселекция: ";
+  if (reselectCnt) {
+    line += String(reselectCnt);
+    if (reselectFail) {
+      line += " (сбой ";
+      line += String(reselectFail);
+      line += ", WUPA status=0x";
+      line += byteHex(reselectStatus);
+      line += ')';
+    }
+  } else {
+    line += "нет";
   }
 
   line += " | CC: ";
