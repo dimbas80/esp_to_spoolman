@@ -21,8 +21,34 @@ MFRC522 mfrc522{ driver };
 GyverDBFile db(&LittleFS, "/data.db");
 SettingsGyver sett("ESP to Spoolman", &db);
 
-sets::Logger logger(1024);  // уменьшен буфер
+//D32: логгер пишет и в RAM-буфер (виджет b.Log), и в /log.txt на LittleFS — по строке.
+FileLogger logger(1024);
 WiFiServer server(80);
+
+size_t FileLogger::write(uint8_t v) {
+  sets::Logger::write(v);  //RAM-буфер логгера: поведение виджета лога не меняется
+  const char* line = nullptr;
+  size_t len = 0;
+  if (_split.feed(v, line, len)) appendLine(line, len);
+  return 1;
+}
+
+//Строка в файл: открыть на дописывание, записать, закрыть. Ошибки FS — только в Serial:
+//логгер не может логировать себя сам (рекурсия), а UI ломать не должен.
+//Открытие/закрытие на строку — осознанно: File, открытый на сессию, пережил бы LittleFS.end()
+//(«Save & Restart») и OTA-обновление фронтенда, то есть стал бы висячим дескриптором.
+void FileLogger::appendLine(const char* data, size_t len) {
+  File f = LittleFS.open(LOG_PATH, "a");
+  if (!f) {
+    Serial.print("Лог: ");
+    Serial.print(LOG_PATH);
+    Serial.println(" не открыт, строка потеряна");
+    return;
+  }
+  f.write((const uint8_t*)data, len);
+  f.write('\n');
+  f.close();
+}
 
 bool LED_SP = false;
 bool LED_MN = false;
@@ -46,6 +72,20 @@ bool ledFxOn = true;
 uint32_t ledFxColor = 0;
 String conflictUID = "";  //D13: UID, по которому уже сообщили владельца (повтор = перелинковка)
 int conflictSpool = 0;    //D13: спул-владелец UID из 409
+//D33: метка считается залинкованной -> запись ждёт подтверждения в вебморде (переходы —
+//confirm_state.h). UID и содержимое метки запоминаются на момент касания: к моменту клика
+//считыватель метку уже не видит (PICC_HaltA), и повторно читать её неоткуда.
+wconfirm::State tagConfirm;
+static String pendingUID = "";      //UID метки, ожидающей подтверждения
+static String pendingPayload = "";  //её содержимое (NDEF payload) — по нему восстанавливается doc
+
+//D33: снять ожидание подтверждения и забыть запомненную метку — только вместе: автомат и
+//сохранённый UID/payload не должны разъезжаться (иначе подтверждение запишет чужую метку).
+static void clearPendingConfirm() {
+  tagConfirm.clear();
+  pendingUID = "";
+  pendingPayload = "";
+}
 unsigned long lastSpoolmanFail = 0;
 unsigned long lastMoonrakerFail = 0;
 bool prevSpoolmanOk = false;
@@ -91,6 +131,8 @@ static void resetWriteState() {
   erasePending = false;
   conflictUID = "";
   conflictSpool = 0;
+  //D33: неподтверждённая запись на залинкованную метку умирает вместе с ожиданием метки
+  clearPendingConfirm();
 }
 
 //=== D28: цвет метки — LED-сватч (кружок) + подпись именем цвета ===
@@ -169,6 +211,8 @@ void build(sets::Builder& b) {
         } else {
           lastUID = 0;  //метка, уже лежащая на считывателе, должна прочитаться заново
           erasePending = false;  //намерение: запись (не стирание)
+          //D33: новая операция не наследует неподтверждённую запись прошлой метки
+          clearPendingConfirm();
           writeStart = millis();
           wstate = WAIT_TAG;
           T_LED_WRITE.restart();
@@ -181,11 +225,23 @@ void build(sets::Builder& b) {
       if (b.Button(web::btn_erase, "Стереть метку", sets::Colors::Red)) {
         lastUID = 0;  //метка, уже лежащая на считывателе, должна прочитаться заново
         erasePending = true;
+        //D33: стирание не наследует ожидание подтверждения записи (иначе Confirm запустил бы запись)
+        clearPendingConfirm();
         writeStart = millis();
         wstate = WAIT_TAG;
         T_LED_WRITE.restart();
         Serial.println("Стирание метки: ожидание метки");
         logger.println("Стирание метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
+      }
+      //D33: метка в поле считывателя уже залинкована к катушке — запись без подтверждения не
+      //начинается. Здесь только подсказка и окно подтверждения; саму запись запускает loop
+      //(writeTick) после клика: HTTP-часть не должна блокировать разбор пакета вебморды.
+      if (tagConfirm.pending()) {
+        String linked = String(tagConfirm.spoolID());
+        b.Label("Метка залинкована к катушке ID:", linked);
+        if (b.Confirm(web::confirm_write, "Записать на залинкованную метку")) {
+          tagConfirm.confirm();
+        }
       }
     }
     {
@@ -307,8 +363,10 @@ void build(sets::Builder& b) {
 }
 
 void update(sets::Updater& upd) {
-  upd.update(H(log), logger);
-  upd.update(H(log_w), logger);  //копия логгера в меню записи
+  //D32: FileLogger — наследник sets::Logger, а template-update() взял бы его по значению
+  //(Logger некопируемый) — явно приводим к базовой ссылке, чтобы работал update(id, Logger&)
+  upd.update(H(log), static_cast<sets::Logger&>(logger));
+  upd.update(H(log_w), static_cast<sets::Logger&>(logger));  //копия логгера в меню записи
 
   //D28: сватч цвета метки — updateColor красит кружок (Label.updateColor красил бы только текст).
   //Шлём только при смене цвета: подпись (имя цвета) приходит с пересборкой страницы, которую
@@ -358,6 +416,18 @@ void updateLED() {
 
 void setup() {
   Serial.begin(115200);
+  //D32: LittleFS поднимается ДО первых записей в логгер — иначе версия и boot reason (D27) не
+  //попали бы в файл. Файловый лог живёт одну сессию: /log.txt усекается на каждом старте
+  //(решение владельца — файл не растёт между перезагрузками).
+  if (LittleFS.begin(true)) {
+    if (LittleFS.exists(LOG_PATH) && !LittleFS.remove(LOG_PATH)) {
+      Serial.print("Лог: ");
+      Serial.print(LOG_PATH);
+      Serial.println(" не усечён (remove не удался)");
+    }
+  } else {
+    Serial.println("Лог: LittleFS не поднялась — файловый лог отключён");
+  }
   Serial.println("Версия " VER);
   logger.println("Версия " VER);
   //D27: причина перезагрузки — единственный след «зависания, вылеченного reboot'ом»
@@ -385,7 +455,7 @@ void setup() {
   sett.config.updateTout = 1000;
   sett.setVersion(VER);
 
-  LittleFS.begin(true);
+  //LittleFS уже поднята в начале setup() (D32: до первых записей логгера)
   db.begin();
   db.init(web::wifi_ssid, "");
   db.init(web::wifi_pass, "");
@@ -415,6 +485,7 @@ void setup() {
   db.init(web::gate3, "пусто");
   db.init(web::btn_write, 0);
   db.init(web::btn_erase, 0);
+  db.init(web::confirm_write, 0);  //D33: окно подтверждения записи на залинкованную метку
   mmu = db[web::sw_mmu]; 
   db[web::nfc_id] = 0;
   db[web::nfc_name] = "";
@@ -1194,13 +1265,32 @@ void readNFC() {
     if (wstate == WAIT_TAG) {
       bool doErase = erasePending;
       erasePending = false;
-      wstate = doErase ? ERASING : WRITING;
+      //D33: новое касание в ожидании — новая операция: прежнее ожидание подтверждения снимается
+      //(иначе подтверждение старой метки могло бы сработать уже после записи новой)
+      clearPendingConfirm();
       if (doErase) {
+        wstate = ERASING;
         setWriteResult(eraseTag());
+        wstate = IDLE;
       } else {
-        tagWriteFlow(uid, payload, doc, parsed);
+        //D33: UID уже залинкован к катушке -> не пишем сразу, ждём подтверждения в вебморде.
+        //Проверка по Spoolman (spoolIDByUID) — та же, что на главной: она же ловит «чужая метка».
+        //Нет WiFi/Spoolman недоступен — подтверждения не будет, пишем как раньше (D33: не linked).
+        int linked = -1;
+        if (spoolIDByUID(uid, linked)) {
+          //wstate остаётся WAIT_TAG: ожидание подтверждения живёт на том же таймауте и той же
+          //индикации, что обычное ожидание метки (D16/D31) — новых состояний не вводим.
+          tagConfirm.begin(linked, millis());
+          pendingUID = uid;
+          pendingPayload = payload;
+          Serial.println("Запись метки " + uid + ": UID залинкован к ID " + String(linked) + ", ждём подтверждения в вебморде");
+          logger.println(sets::Logger::warn() + "Метка " + uid + " залинкована к ID " + String(linked) + " — подтвердите запись в вебморде (иначе отмена через " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
+        } else {
+          wstate = WRITING;
+          tagWriteFlow(uid, payload, doc, parsed);
+          wstate = IDLE;
+        }
       }
-      wstate = IDLE;
     } else {
       //D31: в меню записи светодиод ведёт себя так же, как на главной (раньше не светился вовсе):
       //распознанная метка — YELLOW 2 с, пустая/нераспознанная — мигание RED 2 с (D20-лог выше)
@@ -2579,6 +2669,30 @@ bool eraseTag() {
   return done;
 }
 
+//D33: подтверждение получено — продолжаем запись обычным путём. К этому моменту метка уже
+//отпущена считывателем (readNFC делает PICC_HaltA), поэтому сначала переселекция (D23):
+//без карты в поле писать некуда. Это отдельный случай «метку убрали», а не сбой подтверждения.
+static void confirmWriteRun() {
+  String uid = pendingUID;
+  String payload = pendingPayload;
+  clearPendingConfirm();
+  //Переселекция обязательна (после PICC_HaltA карта в HALT), но её мало: владелец мог за это
+  //время заменить метку на другую. UID сверяется — писать чужой UID'ом чужую метку нельзя.
+  if (!tagReselect() || formatUID() != uid) {
+    Serial.println("Запись метки " + uid + ": метка не в поле считывателя (или заменена), подтверждение не применено");
+    logger.println(sets::Logger::error() + "Запись метки " + uid + ": метка убрана от считывателя или заменена — подтверждение не применено, запись отменена");
+    setWriteResult(false);
+    sett.reload();
+    return;
+  }
+  wstate = WRITING;
+  JsonDocument doc;
+  bool parsed = parseTagJSON(payload, doc);
+  tagWriteFlow(uid, payload, doc, parsed);
+  wstate = IDLE;
+  sett.reload();  //окно подтверждения и поля метки перерисовываются по фактическому итогу
+}
+
 //D16: тик ожидания метки — таймаут 60 с и мигание жёлтым (приоритет над статусным LED).
 //true — LED в этом тике ведёт ожидание метки, статусный updateLED() вызывать не нужно.
 bool writeTick() {
@@ -2587,9 +2701,29 @@ bool writeTick() {
   if (wstate != IDLE && !writeMode) {  //вышли из подменю — ожидание не продолжается
     wstate = IDLE;
     erasePending = false;
+    //D33: неподтверждённая запись на залинкованную метку умирает вместе с ожиданием
+    clearPendingConfirm();
   }
 
-  if (wstate == WAIT_TAG && millis() - writeStart > WRITE_TAG_TIMEOUT) {
+  //D33: метка залинкована — ждём клика в вебморде. Срок отсчитывается от касания метки
+  //(tagConfirm.begin), а не от нажатия кнопки: у владельца полный WRITE_TAG_TIMEOUT на реакцию.
+  if (wstate == WAIT_TAG && tagConfirm.pending()) {
+    if (tagConfirm.confirmed()) {
+      confirmWriteRun();
+    } else if (tagConfirm.expired(millis(), WRITE_TAG_TIMEOUT)) {
+      String uid = pendingUID;
+      wstate = IDLE;
+      erasePending = false;
+      clearPendingConfirm();
+      Serial.println("Запись метки " + uid + ": подтверждение не получено, отменено");
+      logger.println(sets::Logger::warn() + "Запись метки " + uid + ": подтверждение записи на залинкованную метку не получено за " + String(WRITE_TAG_TIMEOUT / 1000) + " с, отменено");
+      sett.reload();  //окно подтверждения должно исчезнуть из вебморды
+    }
+  }
+
+  //Обычный таймаут ожидания метки: при ожидании подтверждения он не действует — у этого
+  //ожидания свой срок (от касания, см. выше).
+  if (wstate == WAIT_TAG && !tagConfirm.pending() && millis() - writeStart > WRITE_TAG_TIMEOUT) {
     //Ожидание было либо записью, либо стиранием (D9) — в логе называем операцию так, как её запускали
     String op = erasePending ? "Стирание метки" : "Запись метки";
     wstate = IDLE;

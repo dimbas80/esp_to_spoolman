@@ -44,12 +44,34 @@ extern MFRC522 mfrc522;
 
 #include <GyverDBFile.h>
 #include <LittleFS.h>
+#include "log_lines.h"     //D32: разбивка потока логгера на строки (host-тестируемо)
+#include "confirm_state.h" //D33: автомат подтверждения записи на залинкованную метку (host-тестируемо)
 extern GyverDBFile db;
 
 #include <SettingsGyver.h>
 extern SettingsGyver sett;
 
-extern sets::Logger logger;
+//=== D32: лог в файл /log.txt ===
+//FileLogger дописывает каждую строку логгера в файл на LittleFS. Файл живёт одну сессию:
+//в setup() после LittleFS.begin(true) он усекается (решение владельца — лог не растёт между
+//перезагрузками). RAM-буфер sets::Logger сохраняется: виджет b.Log продолжает работать.
+//Файл открывается и закрывается на строку: открытый на сессию File стал бы висячим дескриптором
+//при LittleFS.end() («Save & Restart») и при OTA-обновлении фронтенда.
+#define LOG_PATH "/log.txt"
+
+class FileLogger : public sets::Logger {
+   public:
+    FileLogger(size_t size) : sets::Logger(size) {}
+
+    //Print::write (виртуальный) -> сюда: байт уходит и в RAM-буфер логгера, и в разбивку на строки
+    size_t write(uint8_t v) override;
+
+   private:
+    void appendLine(const char* data, size_t len);
+    logline::Splitter _split;
+};
+
+extern FileLogger logger;
 extern WiFiServer server;
 
 DB_KEYS(
@@ -85,6 +107,7 @@ DB_KEYS(
   led_tag_w,  //D28: тот же сватч в меню «Записать метку» (id обязан быть уникальным)
   btn_write,
   btn_erase,
+  confirm_write, //D33: окно подтверждения «Записать на залинкованную метку» (Set-ответ)
   //D30: слоты MMU Gate (Label на главной): «ID 12 · PETG+ Чёрный» либо «пусто»
   gate0,
   gate1,
@@ -122,6 +145,10 @@ extern WriteState wstate;
 extern bool erasePending;
 //Таймаут ожидания метки после нажатия кнопки (D16)
 #define WRITE_TAG_TIMEOUT 60000
+//D33: подтверждение записи на залинкованную метку (переходы — confirm_state.h).
+//Пока оно ждёт клика в вебморде, wstate остаётся WAIT_TAG: тот же таймаут и та же индикация
+//ожидания, что у ожидания метки — новых состояний не вводим.
+extern wconfirm::State tagConfirm;
 //Состояние конфликта 409 (D13): UID, по которому уже сообщили владельца, и спул-владелец.
 //Повторное нажатие «Записать» на том же UID = подтверждение перелинковки.
 extern String conflictUID;
