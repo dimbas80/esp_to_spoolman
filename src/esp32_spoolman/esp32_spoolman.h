@@ -72,9 +72,9 @@ DB_KEYS(
   nfc_color,
   nfc_uid,    //полный UID последней прочитанной метки (D18: поле «UID» на главной)
   //Подменю «Записать метку» (v1.3): список катушек и поля режима записи
-  spool_sel,  //индекс выбранной опции Select (НЕ id катушки — см. spool_ids)
-  spool_ids,  //csv id катушек параллельно опциям Select
-  spool_opts, //опции Select через ';'
+  spool_sel,  //ГЛОБАЛЬНЫЙ индекс выбранной опции Select (НЕ id катушки — см. spool_ids)
+  spool_ids,  //csv id катушек строго параллельно флэт-списку опций Select
+  spool_opts, //опции Select: «[материал]подписи через ';'[материал2]...» (группы библиотеки)
   f_notag,    //фильтр «только катушки без метки»
   w_id,
   w_uid,
@@ -101,7 +101,8 @@ extern bool writeMode;
 #define PAGE_WRITE 1
 #define PAGE_SETTINGS 2
 extern uint8_t activePage;  //страница, открытая в вебморде (держит writeMode)
-//Максимум опций в списке катушек (Select): больше — усечение + лог
+//Максимум опций (катушек) в списке Select: больше — усечение + лог. Заголовки групп по материалу
+//опциями не считаются (фронтенд индексов им не даёт).
 #define N_OPT_MAX 60
 
 //Машина записи v1.3 (D16): IDLE — ничего не ждём; WAIT_TAG — ждём метку после кнопки;
@@ -150,9 +151,9 @@ String ndefPayload();                                        //payload NDEF-за
 bool spoolIDByUID(const String& uid, int& matched);           //POST /api/v1/tag/scan; true если matched_spool_id — число
 bool parseTagJSON(const String& payload, JsonDocument& doc);  //openspool (protocol/spool_id) либо FilaMan (sm_id)
 
-//Режим записи v1.3: список катушек для Select и id выбранной катушки
-bool fetchSpoolList(bool noTagOnly);  //GET /api/v1/spool?allow_archived=false -> spool_opts + spool_ids
-int selectedSpoolID();               //id из spool_ids по индексу spool_sel; -1 если ничего не выбрано
+//Режим записи v1.3: список катушек для Select (группы по материалу) и id выбранной катушки
+bool fetchSpoolList(bool noTagOnly);  //GET /api/v1/spool?allow_archived=false -> spool_opts (группы) + spool_ids
+int selectedSpoolID();               //id из spool_ids по глобальному индексу spool_sel; -1 если ничего не выбрано
 
 //Запись метки v1.3 (D5–D9, D13–D16)
 //D21: результат lock-проверки — ТРИ состояния. «Чип не опознан» — это не read-only:

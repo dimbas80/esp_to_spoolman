@@ -1093,12 +1093,15 @@ void readNFC() {
 
 //=== Режим записи: список катушек для Select ===
 
-//D19: группировка списка по материалу. HTML-элемент optgroup фронтенд библиотеки не знает
-//(строки «optgroup» в script нет), поэтому — псевдогруппировка: сортируем катушки по материалу,
-//и подпись каждой опции начинается с материала: «материал · бренд · цвет · ID».
-//Разделители опций Select — ';' и перевод строки, поэтому в подписи они недопустимы;
-//'[' и ']' не ставим тоже: у Select есть документированный синтаксис групп «[заголовок]опции»,
-//и случайная скобка переключила бы разбор опций, разъехавшись с параллельным массивом id.
+//D19 (v1.3.1): настоящие группы Select синтаксисом библиотеки «[заголовок]опции».
+//Механика сверена с фронтендом Settings 1.3.16 (src/web/settings.h, SelectWidget в сжатом
+//script): разбор групп включается, только если строка опций начинается с '['; заголовки ищутся
+//по /\[(.+?)\]([^\[]+)/g, тело группы («до следующей '['») режется по ';' и '\n', последняя
+//пустая опция отбрасывается. Индекс результата ГЛОБАЛЬНЫЙ по всем опциям всех групп
+//(счётчик идёт сквозь группы), заголовки групп индексов не занимают — поэтому spool_ids
+//строится по флэт-списку опций.
+//Отсюда санитизация данных катушки: '['/']' сломали бы разбор групп (и сдвинули индексы),
+//';'/'\n' добавили бы лишнюю опцию, ведущий '~' спрятал бы опцию, а '~' в заголовке — всю группу.
 static String spoolTextPart(const char* raw) {
   String s = raw ? raw : "";
   char* p = s.begin();
@@ -1109,6 +1112,7 @@ static String spoolTextPart(const char* raw) {
       case '\r': p[i] = ' '; break;
       case '[': p[i] = '('; break;
       case ']': p[i] = ')'; break;
+      case '~': p[i] = '-'; break;
     }
   }
   s.trim();
@@ -1131,10 +1135,19 @@ static bool spoolBefore(JsonObjectConst a, JsonObjectConst b) {
   return spoolId(a) < spoolId(b);
 }
 
-//Подпись опции: «материал · бренд · цвет · ID»; пустые части опускаем, ID показываем всегда
+//Заголовок группы = материал катушки: в подписи опции материал уже не дублируем.
+//Пустой материал заголовком быть не может: «[]» не совпадёт с разбором групп и весь список
+//рассыпется на одну группу без заголовка (индексы при этом сохранятся, но группировка пропадёт).
+static String spoolGroupTitle(JsonObjectConst sp) {
+  String title = spoolTextPart(spoolMaterial(sp));
+  if (!title.length()) title = "Без материала";
+  return title;
+}
+
+//Подпись опции внутри группы: «бренд · цвет · ID» (материал уже в заголовке группы);
+//пустые части опускаем, ID показываем всегда
 static String spoolOptionLabel(JsonObjectConst sp) {
   const char* parts[] = {
-    sp["filament"]["material"] | "",
     sp["filament"]["vendor"]["name"] | "",
     sp["filament"]["color_hex"] | "",
   };
@@ -1148,15 +1161,16 @@ static String spoolOptionLabel(JsonObjectConst sp) {
   if (label.length()) label += " · ";
   label += "ID:";
   label += String(spoolId(sp));
-  //'~' в начале опции фронтенд трактует как «скрыть, сохранив индекс»: опция пропала бы из списка
-  if (label.length() && label.charAt(0) == '~') label.setCharAt(0, '-');
   return label;
 }
 
-//GET /api/v1/spool?allow_archived=false -> отсортированные по материалу опции «материал · бренд ·
-//цвет · ID» через ';' в spool_opts и параллельный csv id в spool_ids: b.Select отдаёт индекс
-//опции, а не id катушки (Review Focus 3). noTagOnly — только катушки без tags.
-//Больше N_OPT_MAX катушек — берём первые N_OPT_MAX (порядок ответа API) и логируем усечение (Q8).
+//GET /api/v1/spool?allow_archived=false -> spool_opts с настоящими группами по материалу
+//(«[PETG]бренд · цвет · ID:12;...;[PLA]...», опции одного материала через ';', материал в подписи
+//не дублируется) и параллельный csv id в spool_ids: b.Select отдаёт ГЛОБАЛЬНЫЙ индекс опции,
+//а не id катушки, поэтому ids строится строго по флэт-списку опций (Review Focus 3).
+//noTagOnly — только катушки без tags.
+//Больше N_OPT_MAX катушек — берём первые N_OPT_MAX (порядок ответа API) и логируем усечение (Q8);
+//усечение считается по катушкам (опциям), заголовки групп лимит не расходуют.
 bool fetchSpoolList(bool noTagOnly) {
   db[web::spool_opts] = "";
   db[web::spool_ids] = "";
@@ -1226,13 +1240,21 @@ bool fetchSpoolList(bool noTagOnly) {
     rows[j + 1] = cur;
   }
 
-  String opts, ids;
+  String opts, ids, groupTitle;
   for (int i = 0; i < cnt; i++) {
-    if (i) {
+    //Граница группы — смена материала (без учёта регистра); заголовок берём у первой катушки
+    //группы, катушки группы разделяются ';'. Заголовок индекса не занимает, ids идёт по опциям.
+    String title = spoolGroupTitle(rows[i]);
+    if (i == 0 || strcasecmp(title.c_str(), groupTitle.c_str()) != 0) {
+      opts += '[';
+      opts += title;
+      opts += ']';
+      groupTitle = title;
+    } else {
       opts += ';';
-      ids += ',';
     }
     opts += spoolOptionLabel(rows[i]);
+    if (i) ids += ',';
     ids += String(spoolId(rows[i]));
   }
 
