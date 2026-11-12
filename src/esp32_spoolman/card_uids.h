@@ -120,15 +120,13 @@ inline bool parse(const char* raw, List& list) {
 }
 
 // Запись в формат SpoolPainter: кавычки по краям, токены через ','. Пустой список —
-// пустое значение поля (кавычек нет: пустая строка читается как «меток нет»).
+// ПАРА КАВЫЧЕК ("" — валидная JSON-строка), не пустое значение: Spoolman проверяет,
+// что значение extra — валидный JSON, и отвечает 400 «Value is not valid JSON» на "".
+// Пустая пара кавычек читается как «меток нет» и самим кодеком (parse -> count 0).
 inline bool serialize(const List& list, char* out, int cap) {
   if (!out || cap <= 2) return false;
   int needed = 2;  // две кавычки
   for (int i = 0; i < list.count; i++) needed += (int)strlen(list.uid[i]) + (i ? 1 : 0);
-  if (list.count == 0) {
-    out[0] = 0;
-    return true;
-  }
   if (needed + 1 > cap) return false;
 
   int ofs = 0;
