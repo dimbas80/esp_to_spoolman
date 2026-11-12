@@ -246,7 +246,7 @@ void build(sets::Builder& b) {
         //Builder::_isSet срабатывает на любое Set-действие с этим id, значение само по себе
         //решением не является.
         bool ok = false;
-        if (b.Button(web::confirm_write, "Записать на залинкованную метку (ID " + linked + ")")) {
+        if (b.Button(web::confirm_write, "Записать на залинкованную метку (ID " + linked + ")", sets::Colors::Red)) {
           ok = b.build.value.toBool();
           if (tagConfirm.reply(ok) == wconfirm::Reply::Confirm) {
             tagConfirm.confirm();
