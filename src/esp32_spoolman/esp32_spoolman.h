@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.3"
+#define VER "1.3.4"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
@@ -107,7 +107,8 @@ DB_KEYS(
   led_tag_w,  //D28: тот же сватч в меню «Записать метку» (id обязан быть уникальным)
   btn_write,
   btn_erase,
-  confirm_write, //D33: окно подтверждения «Записать на залинкованную метку» (Set-ответ)
+  confirm_write, //D35 (v1.3.4): кнопка подтверждения записи на залинкованную метку (Set-ответ)
+  confirm_cancel, //D35 (v1.3.4): кнопка отмены записи на залинкованную метку (Set-ответ)
   //D30: слоты MMU Gate (Label на главной): «ID 12 · PETG+ Чёрный» либо «пусто»
   gate0,
   gate1,

@@ -78,13 +78,8 @@ int conflictSpool = 0;    //D13: спул-владелец UID из 409
 wconfirm::State tagConfirm;
 static String pendingUID = "";      //UID метки, ожидающей подтверждения
 static String pendingPayload = "";  //её содержимое (NDEF payload) — по нему восстанавливается doc
-//D33/F1 (T-H3): окно Confirm — СКРЫТЫЙ узел фронтенда (web/settings.h v1.3.16: конструктор ставит
-//display:none, браузерный AsyncConfirm вызывается только из update()). Значит одного рисования в
-//build() мало: нужен отдельный update-пакет на id окна. Флаг — «активация для текущей отрисовки
-//страницы уже отправлена»: снимается при каждой перерисовке страницы, где узел нарисован, иначе
-//диалог всплывал бы на каждом опросе (~2,5 с); повтор после перерисовки нужен потому, что update
-//на ещё не созданный виджет фронтенд молча отбрасывает.
-static bool confirmActivationSent = false;
+//D35 (v1.3.4): confirmActivationSent и update-активация скрытого Confirm удалены — подтверждение
+//рисуется видимыми кнопками в build() (D35), отдельного активирующего пакета больше нет.
 
 //D33: снять ожидание подтверждения и забыть запомненную метку — только вместе: автомат и
 //сохранённый UID/payload не должны разъезжаться (иначе подтверждение запишет чужую метку).
@@ -92,7 +87,6 @@ static void clearPendingConfirm() {
   tagConfirm.clear();
   pendingUID = "";
   pendingPayload = "";
-  confirmActivationSent = false;  //следующее ожидание активирует окно заново
 }
 unsigned long lastSpoolmanFail = 0;
 unsigned long lastMoonrakerFail = 0;
@@ -241,42 +235,34 @@ void build(sets::Builder& b) {
         Serial.println("Стирание метки: ожидание метки");
         logger.println("Стирание метки: приложите метку к считывателю (ожидание " + String(WRITE_TAG_TIMEOUT / 1000) + " с)");
       }
-      //D33: метка в поле считывателя уже залинкована к катушке — запись без подтверждения не
-      //начинается. Здесь только подсказка и окно подтверждения; саму запись запускает loop
-      //(writeTick) после клика: HTTP-часть не должна блокировать разбор пакета вебморды.
+      //D35 (v1.3.4): вместо скрытого Confirm с update-активацией — две ВИДИМЫЕ кнопки.
+      //Update-пакет не имеет повтора и терялся до готовности перерисованной страницы — диалог
+      //не появлялся. Кнопки рисуются обычным Build-пакетом, клик приходит Set-действием.
       if (tagConfirm.pending()) {
         String linked = String(tagConfirm.spoolID());
         b.Label("Метка залинкована к катушке ID:", linked);
-        //D33/F1 (T-H3): узел Confirm скрыт, диалог открывает update-пакет из update() (см. там же).
-        //Флаг «активация отправлена» снимаем, когда страница с этим узлом действительно
-        //(пере)рисована: полная сборка (Build) или вход в меню записи. Иначе пакет активации мог
-        //уйти в никуда (виджета ещё не было), а лишний сброс на чужом действии дал бы второе окно
-        //поверх ещё не закрытого.
-        if (b.build.isBuild() || enteredWrite) confirmActivationSent = false;
-        //D33/F2 (T-H3): Builder::_isSet возвращает true на ЛЮБОЕ Set-действие с этим id и значение
-        //не смотрит, поэтому ответ диалога читаем явно (&ok): OK (1) — подтверждение, «Отмена» (0) —
-        //отмена, как по таймауту. Иначе «Отмена» тоже запускала бы запись.
+        //D35 (v1.3.4): Button не имеет перегрузки с bool* (в отличие от Confirm) — значение Set
+        //читаем явно из b.build.value: «1» — подтверждение, «0» — не подтверждение.
+        //Builder::_isSet срабатывает на любое Set-действие с этим id, значение само по себе
+        //решением не является.
         bool ok = false;
-        if (b.Confirm(web::confirm_write, "Записать на залинкованную метку", &ok)) {
-          switch (tagConfirm.reply(ok)) {
-            case wconfirm::Reply::Confirm:
-              tagConfirm.confirm();
-              Serial.println("Запись метки " + pendingUID + ": подтверждена в вебморде");
-              logger.println("Метка " + pendingUID + ": запись подтверждена в вебморде");
-              break;
-            case wconfirm::Reply::Cancel: {
-              String uid = pendingUID;
-              wstate = IDLE;  //отмена = как по таймауту: ожидание метки и запись сняты
-              erasePending = false;
-              clearPendingConfirm();
-              Serial.println("Запись метки " + uid + ": отменена в вебморде");
-              logger.println(sets::Logger::warn() + "Запись метки " + uid + ": отменена в вебморде, запись не выполнена");
-              sett.reload();  //окно и подсказка должны исчезнуть из вебморды
-              break;
-            }
-            default:
-              break;  //ответа не ждали или подтверждение уже получено — ничего не делаем
+        if (b.Button(web::confirm_write, "Записать на залинкованную метку (ID " + linked + ")")) {
+          ok = b.build.value.toBool();
+          if (tagConfirm.reply(ok) == wconfirm::Reply::Confirm) {
+            tagConfirm.confirm();
+            Serial.println("Запись метки " + pendingUID + ": подтверждена в вебморде");
+            logger.println("Метка " + pendingUID + ": запись подтверждена в вебморде");
           }
+        }
+        //Отмена: снять ожидание, ничего не писать (как по таймауту)
+        if (b.Button(web::confirm_cancel, "Отмена")) {
+          String uid = pendingUID;
+          wstate = IDLE;
+          erasePending = false;
+          clearPendingConfirm();
+          Serial.println("Запись метки " + uid + ": отменена в вебморде");
+          logger.println(sets::Logger::warn() + "Запись метки " + uid + ": отменена в вебморде, запись не выполнена");
+          sett.reload();  //кнопки и подсказка должны исчезнуть из вебморды
         }
       }
     }
@@ -407,25 +393,35 @@ void update(sets::Updater& upd) {
   //D28: сватч цвета метки — updateColor красит кружок (Label.updateColor красил бы только текст).
   //Шлём только при смене цвета: подпись (имя цвета) приходит с пересборкой страницы, которую
   //делает readNFC (sett.reload после касания).
+  //D35 (v1.3.4): скрытый Confirm и update-активация убраны — подтверждение видно кнопками в build().
+
+  //D37 (v1.3.4): id update-пакетов — только из DB_KEYS. H(led_tag)/H(led_tag_w) маскируются
+  //(DB_HASH_MASK) и расходятся со значением web::*, которым виджет нарисован в build() — пакет
+  //уходит на несуществующий id и фронтенд молча отбрасывает его. У led_tag/led_tag_w хэши
+  //SH=0x6C724DB0/0x523C8666 — старшие биты реально терялись; у log/log_w/gate0..3 хэши в 29 бит
+  //укладываются (проверено расчётом), поэтому там H() и web::* численно совпадают, но для
+  //единообразия правила upd.update-вызовы ведут по id из DB_KEYS (см. D37-тест в host-tests).
   static String lastMainColor, lastWriteColor;
   String mainColor = db[web::nfc_color];
   if (mainColor != lastMainColor) {
     lastMainColor = mainColor;
     bool has = false;
-    upd.updateColor(H(led_tag), swatchColor(mainColor.c_str(), has));
+    upd.updateColor((size_t)web::led_tag, swatchColor(mainColor.c_str(), has));
   }
   String writeColor = db[web::w_color];
   if (writeColor != lastWriteColor) {
     lastWriteColor = writeColor;
     bool has = false;
-    upd.updateColor(H(led_tag_w), swatchColor(writeColor.c_str(), has));
+    upd.updateColor((size_t)web::led_tag_w, swatchColor(writeColor.c_str(), has));
   }
 
   //D30: слоты Gate обновляются тем же каналом и в том же цикле, что и индикаторы серверов;
   //шлём только изменившиеся слоты (опрос — раз в T_GATES, лишний трафик каждую секунду не нужен)
   if (mmu) {
     static String lastGates[4] = { "", "", "", "" };
-    const size_t gateIds[4] = { H(gate0), H(gate1), H(gate2), H(gate3) };
+    //D37 (v1.3.4): id — из DB_KEYS (web::gateN), не H(gateN): оба числа сегодня совпадают
+    //(хэш «gate0..3» < 2^29), но правило одно для всех update-пакетов — id только из DB_KEYS.
+    const size_t gateIds[4] = { (size_t)web::gate0, (size_t)web::gate1, (size_t)web::gate2, (size_t)web::gate3 };
     const String gateTexts[4] = { String(db[web::gate0]), String(db[web::gate1]), String(db[web::gate2]), String(db[web::gate3]) };
     for (int i = 0; i < 4; i++) {
       if (gateTexts[i] == lastGates[i]) continue;
@@ -434,24 +430,6 @@ void update(sets::Updater& upd) {
     }
   }
 
-  //D33/F1 (T-H3): активация окна подтверждения. Узел Confirm — скрытый (web/settings.h v1.3.16:
-  //в конструкторе display:none), браузерный диалог AsyncConfirm открывается ТОЛЬКО из его update()
-  //— контракт библиотеки (core/builder.h:653) и эталонный паттерн (demo_data.ino:99-118: кнопка
-  //ставит флаг, update() шлёт пакет). Рисования в build() недостаточно: без пакета владелец не
-  //увидит окна и подтвердить запись не сможет. Шлём один раз на отрисовку страницы (флаг снимает
-  //build), текст диалога — что именно подтверждается.
-  if (tagConfirm.pending() && !tagConfirm.confirmed() && !confirmActivationSent) {
-    confirmActivationSent = true;
-    String dialog = "Метка залинкована к катушке ID ";
-    dialog += String(tagConfirm.spoolID());
-    dialog += " — подтвердить запись?";
-    //ID берём ТОЛЬКО из web::confirm_write — тот же, каким виджет нарисован в build().
-    //H(confirm_write) здесь не годится: DB_KEYS маскирует хэш (DB_HASH_MASK, GyverDB), поэтому
-    //H("confirm_write")=0x7E7CABB8, а web::confirm_write=0x1E7CABB8 — пакет ушёл бы на
-    //несуществующий виджет и фронтенд молча его отбросил бы (проверено компилятором на этой плате).
-    const size_t id = (size_t)web::confirm_write;
-    upd.update(id, dialog);  //текст диалога; String, а не StringSumHelper — иначе template-update
-  }
 }
 
 //Обновление светодиода по текущему состоянию
@@ -1274,9 +1252,16 @@ static int tagSpoolID(JsonDocument& doc) {
 //Машина записи по касанию метки в WAIT_TAG (определение — в секции «Запись метки v1.3» в конце файла)
 static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocument& tagDoc, bool parsed);
 
+//D34 (v1.3.4): дедуп касаний по гэпу. Одиночный пропуск WUPA (штатная потеря ответа, D23) не
+//должен обнулять lastUID — иначе та же метка переобрабатывается, а в WAIT_TAG это перезапускало
+//бы таймер подтверждения вечно. Метка считается «ушедшей» только если её не видно дольше DEDUP_GAP.
+#define TAG_DEDUP_GAP 2000
+static unsigned long lastSeenMs = 0;
+
 void readNFC() {
   if (!mfrc522.PICC_IsNewCardPresent()) {
-    lastUID = 0;
+    //D34: метки нет сейчас — но сбрасываем дедуп только по гэпу (см. выше)
+    if (millis() - lastSeenMs > TAG_DEDUP_GAP) lastUID = 0;
     return;
   }
   if (!mfrc522.PICC_ReadCardSerial()) {
@@ -1288,6 +1273,7 @@ void readNFC() {
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     uidHash = (uidHash << 8) | mfrc522.uid.uidByte[i];
   }
+  lastSeenMs = millis();  //D34: метка видна — гэп отсчитывается от этого момента
   if (uidHash == lastUID) {
     mfrc522.PICC_HaltA();
     return;
@@ -1320,6 +1306,13 @@ void readNFC() {
     if (wstate == WAIT_TAG) {
       bool doErase = erasePending;
       erasePending = false;
+      //D34: повторное касание ТОЙ ЖЕ pending-метки — состояние не трогаем: подтверждение всё
+      //ещё ждём, таймер не перезапускаем (иначе касание вечно продлевало бы ожидание).
+      if (tagConfirm.pending() && uid == pendingUID) {
+        mfrc522.PICC_HaltA();
+        nfcDiagLogOnce(uid);
+        return;
+      }
       //D33: новое касание в ожидании — новая операция: прежнее ожидание подтверждения снимается
       //(иначе подтверждение старой метки могло бы сработать уже после записи новой)
       clearPendingConfirm();
@@ -2785,6 +2778,7 @@ bool writeTick() {
     erasePending = false;
     Serial.println(op + ": таймаут ожидания, отменено");
     logger.println(sets::Logger::warn() + op + ": метка не приложена за " + String(WRITE_TAG_TIMEOUT / 1000) + " с, отменено");
+    sett.reload();  //D36 (v1.3.4): UI не должен висеть в «ожидании» — перерисовка как в ветке истечения подтверждения
   }
 
   if (wstate != WAIT_TAG) return false;
