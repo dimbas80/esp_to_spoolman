@@ -2282,6 +2282,70 @@ static int tagPayloadFormat(JsonDocument& doc, bool parsed) {
 
 //=== D29: card_uids в spool.extra (формат SpoolPainter) ===
 
+//D38: найти все катушки, у которых в extra.card_uids есть этот UID (формат SpoolPainter,
+//значение может прийти с кавычками-обёрткой и без — разбор через кодек carduids.h).
+//GET /api/v1/spool?limit=1000 (как в updateMmuGates), фильтр полей: id + extra.card_uids.
+//Возвращает число найденных id. Ошибка сети/HTTP/разбора — 0 и запись в Serial+логгер:
+//очистка card_uids при стирании не должна прерывать сам стирание (симметрия D29).
+#define SPOOLS_BY_CARD_UID_MAX 16  //достаточно с запасом: UID держат единицы катушек
+static int spoolsByCardUid(const String& uid, int* outIds, int maxIds) {
+  if (outIds && maxIds > 0) outIds[0] = 0;
+  int found = 0;
+  if (!uid.length() || !outIds || maxIds <= 0) return 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("card_uids: нет WiFi (поиск катушек по UID " + uid + ")");
+    return 0;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?limit=1000";
+  http.begin(url);
+  http.setTimeout(2000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.println("card_uids: список катушек -> HTTP " + String(code));
+    logger.println(sets::Logger::warn() + "card_uids: список катушек не получен (HTTP " + String(code) + "), поиск по UID " + uid + " не выполнен");
+    if (code <= 0) lastSpoolmanFail = millis();
+    return 0;
+  }
+
+  JsonDocument filter;
+  filter[0]["id"] = true;
+  filter[0]["extra"]["card_uids"] = true;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    Serial.println("card_uids: список катушек: ошибка разбора " + String(error.c_str()));
+    logger.println(sets::Logger::warn() + "card_uids: список катушек не разобран (" + String(error.c_str()) + "), поиск по UID " + uid + " не выполнен");
+    return 0;
+  }
+
+  char norm[carduids::kUidLen];
+  if (!carduids::normalizeUid(uid.c_str(), norm, sizeof(norm))) return 0;
+
+  for (JsonObject sp : doc.as<JsonArray>()) {
+    int id = spoolId(sp);
+    if (id <= 0) continue;
+    String raw = extraText(sp["extra"]["card_uids"]);
+    if (!raw.length()) continue;
+    carduids::List list;
+    if (!carduids::parse(raw.c_str(), list)) continue;  //чужой/битый формат — не трогаем
+    for (int i = 0; i < list.count; i++) {
+      if (!carduids::equalsNoCase(list.uid[i], norm)) continue;
+      bool dup = false;  //одна катушка — один результат: защита от повторных id в ответе API
+      for (int j = 0; j < found; j++) {
+        if (outIds[j] == id) { dup = true; break; }
+      }
+      if (!dup && found < maxIds) outIds[found++] = id;
+      break;  //UID в поле этой катушки найден, дальше токены не смотрим
+    }
+  }
+  return found;
+}
+
 //GET /api/v1/spool/{id} -> PATCH /api/v1/spool/{id} {"extra": {...}} с мержем extra.
 //add=true — дописать UID в card_uids (без дублей), false — убрать (стирание/отвязка).
 //Формат значения — как у SpoolPainter: кавычки ВНУТРИ значения, hex верхним регистром
@@ -2668,10 +2732,13 @@ bool eraseTag() {
 
   //2) D9: отвязка UID — владелец по тегу, затем DELETE. 404 = линковки нет (не ошибка).
   bool done = true;
+  bool unlinkDone = false;   //D38: 200/204 — отвязка выполнена
+  bool unlinkFailed = false; //D38: -1 (запрос не выполнен) либо HTTP-ошибка — состояние неизвестно
   int owner = ownerSpoolByTag(uid);
   if (owner > 0) {
     int code = unlinkTagRequest(uid, owner);
     if (code == 200 || code == 204) {
+      unlinkDone = true;
       if (chipWiped) {
         Serial.println("Стирание метки " + uid + ": линковка с катушкой ID:" + String(owner) + " снята");
         logger.println("Стирание метки " + uid + ": линковка с катушкой ID:" + String(owner) + " снята");
@@ -2680,7 +2747,6 @@ bool eraseTag() {
         Serial.println("Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
         logger.println(sets::Logger::warn() + "Метка " + uid + " read-only, содержимое не стёрто, линковка снята (ID:" + String(owner) + ")");
       }
-      cardUidsUpdate(owner, uid, false);  //D29: симметрия линковке — UID уходит из card_uids
     } else if (code == 404) {
       //На этой катушке линковки нет: метка могла быть привязана к филаменту
       if (tagLinkedToFilament(uid)) {
@@ -2690,6 +2756,7 @@ bool eraseTag() {
         logger.println("Стирание метки " + uid + ": линковки на катушке ID:" + String(owner) + " нет (404)");
       }
     } else {
+      unlinkFailed = true;
       logger.println(sets::Logger::error() + "Стирание метки " + uid + ": отвязка от катушки ID:" + String(owner) + " не удалась (HTTP " + String(code) + ")");
       done = false;
     }
@@ -2702,10 +2769,45 @@ bool eraseTag() {
     }
   } else {
     //-1: запрос владельца не выполнен (залогировано) — состояние линковки неизвестно
+    unlinkFailed = true;
     done = false;
   }
 
-  //3) Финал: содержимого на чипе больше нет, поэтому поля «Метка в поле считывателя» очищаем.
+  //3) D38: UID уходит из card_uids ВСЕХ катушек, где он найден. Владелец из tag/scan может
+  //отсутствовать (404/нет линковки/чип read-only) — это больше не блокирует очистку: катушки
+  //ищем по extra.card_uids через spoolsByCardUid и объединяем с owner без дублей вызовов.
+  //Очистка НЕ выполняется, если чип не очищен И отвязка не выполнена (wipe-отказ выше уже
+  //вернул false; здесь остаётся случай HTTP-ошибки отвязки / неизвестного состояния линковки).
+  if (chipWiped || unlinkDone || !unlinkFailed) {
+    int spools[SPOOLS_BY_CARD_UID_MAX];
+    int nSpools = spoolsByCardUid(uid, spools, SPOOLS_BY_CARD_UID_MAX);
+    int ids[1 + SPOOLS_BY_CARD_UID_MAX];
+    int nIds = 0;
+    if (owner > 0) ids[nIds++] = owner;
+    for (int i = 0; i < nSpools; i++) {
+      bool dup = false;
+      for (int j = 0; j < nIds; j++) {
+        if (ids[j] == spools[i]) { dup = true; break; }
+      }
+      if (!dup) ids[nIds++] = spools[i];
+    }
+    if (nIds) {
+      String list;
+      for (int i = 0; i < nIds; i++) {
+        if (i) list += ", ";
+        list += "ID:" + String(ids[i]);
+        cardUidsUpdate(ids[i], uid, false);  //D29/D38: UID уходит из card_uids (ошибка — только лог)
+      }
+      Serial.println("Стирание метки " + uid + ": owner " + (owner > 0 ? String("ID:") + owner : String("не найден")) +
+                     ", card_uids на катушках " + list + " -> PATCH");
+      logger.println("Стирание метки " + uid + ": card_uids очищен на катушках " + list);
+    } else {
+      Serial.println("Стирание метки " + uid + ": owner не найден, card_uids на катушках не найдены");
+      logger.println("Стирание метки " + uid + ": катушек с этим UID в card_uids нет");
+    }
+  }
+
+  //4) Финал: содержимого на чипе больше нет, поэтому поля «Метка в поле считывателя» очищаем.
   //Если чип read-only, поля оставляем — они отражают то, что реально лежит на метке (как в T3).
   if (chipWiped) {
     db[web::w_id] = 0;
