@@ -41,3 +41,6 @@ build/*.cache
 build/sdkconfig
 build/partitions.csv
 build/build_opt.h
+
+# Промежуточные артефакты сборки (релиз собирается в build/ через scripts/package_build.sh)
+.build/

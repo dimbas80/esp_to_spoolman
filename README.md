@@ -59,13 +59,22 @@
 | spiffs (LittleFS, настройки) | data/spiffs | 0x330000 | 768 КБ |
 | coredump | data/coredump | 0x3F0000 | 64 КБ |
 
-Сборка (те же опции платы, что и раньше, плюс кастомная разметка):
+Сборка релиза — один скрипт, в `build/` остаются ровно два файла с версией в имени:
+
+```bash
+./scripts/package_build.sh
+# build/esp32_spoolman_v1.3.5_full.bin   полная прошивка (USB, write_flash 0x0)
+# build/esp32_spoolman_v1.3.5_ota.bin    образ приложения для OTA
+```
+
+Версия берётся из `src/esp32_spoolman/esp32_spoolman.h` (`VER`), промежуточные
+артефакты arduino-cli лежат в `.build/` и в git не попадают. Эквивалент вручную:
 
 ```bash
 arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota,CDCOnBoot=cdc \
   --build-property "build.partitions=custom" \
   --build-property "upload.maximum_size=1638400" \
-  --build-path /tmp/esp32_spoolman-build src/esp32_spoolman
+  --build-path .build src/esp32_spoolman
 ```
 
 `upload.maximum_size=1638400` (0x190000) — реальный размер OTA-слота. Без него
@@ -81,7 +90,9 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota,CDCOnBoot=
 ```bash
 arduino-cli upload -p /dev/ttyACM0 \
   --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota,CDCOnBoot=cdc \
-  --build-path /tmp/esp32_spoolman-build src/esp32_spoolman
+  --build-path .build src/esp32_spoolman
+# либо напрямую полной прошивкой:
+esptool.py --chip esp32c3 -p /dev/ttyACM0 write_flash 0x0 build/esp32_spoolman_v<VER>_full.bin
 ```
 
 В Arduino IDE достаточно выбрать те же опции платы и нажать «Загрузка».
@@ -93,13 +104,13 @@ arduino-cli upload -p /dev/ttyACM0 \
 
 ### Дальнейшие обновления — по OTA
 
-1. Собрать образ той же командой (разметка custom) — нужен только `esp32_spoolman.ino.bin`.
-2. Кнопка «Обновить прошивку» в web-интерфейсе устройства (Настройки) — выбрать файл
-   `esp32_spoolman.ino.bin`, устройство запишет его во второй слот и перезагрузится.
+1. Собрать релиз: `./scripts/package_build.sh` — нужен файл `build/esp32_spoolman_v<VER>_ota.bin`.
+2. Кнопка «Обновить прошивку» в web-интерфейсе устройства (Настройки) — выбрать этот файл,
+   устройство запишет его во второй слот и перезагрузится.
 3. Либо из консоли:
 
 ```bash
-curl --data-binary @/tmp/esp32_spoolman-build/esp32_spoolman.ino.bin \
+curl --data-binary @build/esp32_spoolman_v<VER>_ota.bin \
   http://<ip-устройства>/ota
 ```
 
@@ -107,7 +118,7 @@ curl --data-binary @/tmp/esp32_spoolman-build/esp32_spoolman.ino.bin \
 После перезагрузки устройство стартует с нового слота; при неудачном обновлении
 загрузчик остаётся на рабочем образе. Настройки (LittleFS) и NVS при OTA не
 затрагиваются — повторная настройка Wi-Fi не требуется. Откат — залить предыдущий
-`esp32_spoolman.ino.bin` тем же способом.
+`esp32_spoolman_v<VER>_ota.bin` тем же способом.
 
 ## Локальный патч библиотеки Settings (шрифт групп) — v1.3.2
 
