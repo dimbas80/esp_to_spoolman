@@ -2300,13 +2300,15 @@ static int spoolsByCardUid(const String& uid, int* outIds, int maxIds) {
   HTTPClient http;
   String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?limit=1000";
   http.begin(url);
-  http.setTimeout(2000);
+  http.setTimeout(10000);  //D41: полный список идёт дольше 2 с — из-за 2 с bulk-GET списки обрывались
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  uint32_t tGet = millis();
   int code = http.GET();
   if (code != 200) {
     http.end();
-    Serial.println("card_uids: список катушек -> HTTP " + String(code));
-    logger.println(sets::Logger::warn() + "card_uids: список катушек не получен (HTTP " + String(code) + "), поиск по UID " + uid + " не выполнен");
+    uint32_t dt = millis() - tGet;
+    Serial.println("card_uids: список катушек -> HTTP " + String(code) + " за " + String(dt) + " мс");
+    logger.println(sets::Logger::warn() + "card_uids: список катушек не получен (HTTP " + String(code) + " за " + String(dt) + " мс), поиск по UID " + uid + " не выполнен");
     if (code <= 0) lastSpoolmanFail = millis();
     return 0;
   }
@@ -2315,18 +2317,21 @@ static int spoolsByCardUid(const String& uid, int* outIds, int maxIds) {
   filter[0]["id"] = true;
   filter[0]["extra"]["card_uids"] = true;
   JsonDocument doc;
+  int bytes = http.getSize();  //D41: размер ответа; chunked у ESP32-клиента может дать -1
   DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
   if (error) {
-    Serial.println("card_uids: список катушек: ошибка разбора " + String(error.c_str()));
-    logger.println(sets::Logger::warn() + "card_uids: список катушек не разобран (" + String(error.c_str()) + "), поиск по UID " + uid + " не выполнен");
+    Serial.println("card_uids: список катушек: ошибка разбора " + String(error.c_str()) + " (байт: " + String(bytes) + ")");
+    logger.println(sets::Logger::warn() + "card_uids: список катушек не разобран (" + String(error.c_str()) + ", байт: " + String(bytes) + "), поиск по UID " + uid + " не выполнен");
     return 0;
   }
 
   char norm[carduids::kUidLen];
   if (!carduids::normalizeUid(uid.c_str(), norm, sizeof(norm))) return 0;
 
+  int spools = 0;  //D41: фактический объём списка после фильтра
   for (JsonObject sp : doc.as<JsonArray>()) {
+    spools++;
     int id = spoolId(sp);
     if (id <= 0) continue;
     String raw = extraText(sp["extra"]["card_uids"]);
@@ -2343,6 +2348,7 @@ static int spoolsByCardUid(const String& uid, int* outIds, int maxIds) {
       break;  //UID в поле этой катушки найден, дальше токены не смотрим
     }
   }
+  Serial.println("card_uids: список катушек " + String(spools) + " шт., владельцы UID " + uid + ": " + String(found));
   return found;
 }
 
@@ -2425,6 +2431,24 @@ static bool cardUidsUpdate(int spoolID, const String& uid, bool add) {
   return true;
 }
 
+//D39: после добавления UID новому владельцу снять его со «старых» — фактические
+//владельцы поля (spoolsByCardUid) минус новый владелец (планировщик planCardUidUpdates
+//в card_uids.h, host-тест test_card_uid_updates.cpp). Ошибки отдельных снятий не
+//прерывают остальные и не влияют на результат линковки (симметрия D29/D41).
+static void cardUidsUnlinkStale(const String& uid, int newOwner) {
+  if (newOwner <= 0 || !uid.length()) return;
+  int holders[SPOOLS_BY_CARD_UID_MAX];
+  int found = spoolsByCardUid(uid, holders, SPOOLS_BY_CARD_UID_MAX);
+  carduids::UnlinkPlan plan = carduids::planCardUidUpdates(newOwner, holders, found);
+  if (!plan.count) return;
+  for (int i = 0; i < plan.count; i++) {
+    Serial.println("card_uids: снятие UID " + uid + " со старой катушки ID:" + String(plan.ids[i]));
+    if (!cardUidsUpdate(plan.ids[i], uid, false)) {
+      Serial.println("card_uids: снятие с ID:" + String(plan.ids[i]) + " не выполнено — останется в поле");
+    }
+  }
+}
+
 //D8/D13: линковка с двухшаговым подтверждением конфликта. true — UID привязан к spoolID.
 static bool linkWithConflict(const String& uid, int spoolID) {
   String holder;
@@ -2433,7 +2457,11 @@ static bool linkWithConflict(const String& uid, int spoolID) {
     conflictSpool = 0;
     Serial.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
     logger.println("Метка " + uid + " привязана к катушке ID:" + String(spoolID));
-    cardUidsUpdate(spoolID, uid, true);  //D29: UID в spool.extra.card_uids (ошибка — только лог)
+    //D29: UID в spool.extra.card_uids (ошибка — только лог)
+    cardUidsUpdate(spoolID, uid, true);
+    //D39: UID мог остаться у старых катушек (переиспользованная метка, ручные правки
+    //в Spoolman) — снимаем со всех фактических владельцев, кроме нового
+    cardUidsUnlinkStale(uid, spoolID);
     return true;
   }
   if (!holder.length()) return false;  //не 409 либо владелец без id — уже залогировано
@@ -2470,6 +2498,9 @@ static bool linkWithConflict(const String& uid, int spoolID) {
   //D29: симметрия перелинковки — UID уходит из card_uids старой катушки и появляется у новой
   cardUidsUpdate(holderSpool, uid, false);
   cardUidsUpdate(spoolID, uid, true);
+  //D39: перелинковка — проверяем и остальных: UID мог числиться ещё где-то
+  //(дубли в card_uids от ручных правок Spoolman или прошлых сбоев)
+  cardUidsUnlinkStale(uid, spoolID);
   return true;
 }
 

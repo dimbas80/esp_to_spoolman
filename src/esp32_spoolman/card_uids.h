@@ -171,4 +171,36 @@ inline Status drop(const char* raw, const char* uid, char* out, int cap) {
   return serialize(list, out, cap) ? CHANGED : REFUSED;
 }
 
+// Планировщик снятия UID со «старых» катушек при записи/перелинковке (D39 v1.3.5).
+// Дана катушка-новый владелец и фактические владельцы поля (id катушек, где UID
+// числится в extra.card_uids). Возвращает список катушек, с которых надо УБРАТЬ
+// UID: держатели без нового владельца. Новый владелец, id <= 0 и дубликаты
+// (могут прийти из API или от tag/scan) в список снятия не попадают.
+// Порядок вызова на устройстве: сначала add() новой катушке, потом drop() по
+// этому списку — тогда самый худший отказ сети оставляет UID минимум на одном
+// держателе, а не ни на одном.
+struct UnlinkPlan {
+  int ids[kMaxUids];
+  int count;
+};
+
+inline UnlinkPlan planCardUidUpdates(int newOwner, const int* holders, int holdersCount) {
+  UnlinkPlan plan;
+  plan.count = 0;
+  if (holdersCount <= 0 || !holders) return plan;
+
+  bool skipNew = newOwner > 0;  //id <= 0 владельцем не является: убрать отовсюду
+  for (int i = 0; i < holdersCount && plan.count < kMaxUids; i++) {
+    int id = holders[i];
+    if (id <= 0) continue;
+    if (skipNew && id == newOwner) continue;
+    bool dup = false;
+    for (int j = 0; j < plan.count; j++) {
+      if (plan.ids[j] == id) { dup = true; break; }
+    }
+    if (!dup) plan.ids[plan.count++] = id;
+  }
+  return plan;
+}
+
 }  // namespace carduids
