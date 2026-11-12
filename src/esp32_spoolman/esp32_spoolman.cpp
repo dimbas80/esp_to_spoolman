@@ -2185,10 +2185,11 @@ static int jsonInt(JsonVariantConst v, int def) {
 }
 
 //D6: данные катушки из Spoolman (GET /api/v1/spool/{id}) для сборки openspool-JSON
-bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp) {
+bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp, String& subtype) {
   material = "";
   brand = "";
   colorHex = "";
+  subtype = "";
   extruderTemp = 0;
   bedTemp = 0;
   if (spoolID <= 0) return false;
@@ -2225,13 +2226,27 @@ bool readSpoolForTag(int spoolID, String& material, String& brand, String& color
   colorHex = doc["filament"]["color_hex"] | "";
   extruderTemp = jsonInt(doc["filament"]["settings_extruder_temp"], 0);
   bedTemp = jsonInt(doc["filament"]["settings_bed_temp"], 0);
+  subtype = extraText(doc["filament"]["extra"]["subtype"]);
+  //D44: extra.subtype хранит значение в кавычках-обёртке формата SpoolPainter — не данные.
+  //Снимаем только парные кавычки по краям; одиночная кавычка остаётся частью значения.
+  {
+    int b = 0, e = subtype.length();
+    while (b < e && subtype[b] == ' ') b++;
+    while (e > b && subtype[e - 1] == ' ') e--;
+    if (e - b >= 2 && subtype[b] == '"' && subtype[e - 1] == '"') {
+      subtype = subtype.substring(b + 1, e - 1);
+      subtype.trim();
+    }
+  }
   return true;
 }
 
-//D6: openspool-JSON из данных Spoolman. Значения — строки, как в эталонной метке Spool Painter
-//(nfc_spoolpainter.md: "min_temp":"220", "spool_id":"37"); bed_min_temp/bed_max_temp — ключи
-//расширения openspool, которыми пишет Spool Painter (в D6 они названы bed_min/bed_max).
-static String buildOpenspoolJSON(int spoolID, const String& material, const String& brand, const String& colorHex, int extruderTemp, int bedTemp) {
+//D43/D44: openspool-JSON всегда собирается из данных Spoolman (вендорские метки больше не читаются).
+//Значения — строки, как в эталонной метке Spool Painter (nfc_spoolpainter.md: "min_temp":"220",
+//"spool_id":"37"); bed_min_temp/bed_max_temp — ключи расширения openspool, которыми пишет
+//Spool Painter (в D6 они названы bed_min/bed_max). subtype берётся из filament.extra.subtype
+//Spoolman (D44), без значения — Basic (пустой subtype в метку не пишем).
+static String buildOpenspoolJSON(int spoolID, const String& material, const String& brand, const String& colorHex, int extruderTemp, int bedTemp, const String& subtype) {
   JsonDocument doc;
   doc["protocol"] = "openspool";
   doc["version"] = "1.0";
@@ -2251,24 +2266,16 @@ static String buildOpenspoolJSON(int spoolID, const String& material, const Stri
     logger.println(sets::Logger::warn() + "Запись метки: settings_bed_temp не задан — температуры стола не пишем");
   }
   doc["spool_id"] = String(spoolID);
-  doc["subtype"] = "Basic";
+  doc["subtype"] = subtype.length() ? subtype : "Basic";
 
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-//D5/Review Focus 2: в вендорский JSON дописываем ТОЛЬКО spool_id; re-serialize через ArduinoJson
-//сохраняет все ключи вендора (температуры и subtype не трогаем).
-static String augmentVendorJSON(JsonDocument& doc, int spoolID) {
-  doc["spool_id"] = String(spoolID);
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
-
-//Формат содержимого метки: 0 — пусто/не распознано (пишем openspool из Spoolman, D6),
-//1 — вендорский/openspool (дописываем spool_id, D5), 2 — FilaMan legacy (полная замена, D15).
+//D43: формат прежнего содержимого метки — только для журнала записи («метка вендора …»,
+//«метка openspool …»); на сборку payload больше не влияет — запись всегда полными данными
+//из Spoolman (readSpoolForTag + buildOpenspoolJSON).
 static int tagPayloadFormat(JsonDocument& doc, bool parsed) {
   if (!parsed) return 0;
   if (doc["protocol"].is<const char*>()) return 1;
@@ -2535,34 +2542,26 @@ static void tagWriteFlow(const String& uid, const String& payloadIn, JsonDocumen
     return;  //поля w_* уже отражают фактическое содержимое метки (её не меняли)
   }
 
-  //2) Что пишем: вендорский JSON + spool_id (D5), FilaMan — полная замена (D15), пусто — из Spoolman (D6)
+  //2) D43: payload всегда собирается заново из Spoolman — режим «вендорской метки»
+  //(дописка spool_id в существующий JSON) убран; fmt — только для журнала.
   int fmt = tagPayloadFormat(tagDoc, parsed);
-  String payloadOut;
-  if (fmt == 1) {
-    payloadOut = augmentVendorJSON(tagDoc, spoolID);
-    if (!payloadOut.length()) {
-      logger.println(sets::Logger::error() + "Запись метки: не удалось пересобрать вендорский JSON");
-      setWriteResult(false);
-      return;
-    }
-    Serial.println("Вендорская метка: дописан spool_id=" + String(spoolID) + ", ключи сохранены");
-    logger.println("Вендорская метка: дописан spool_id=" + String(spoolID) + ", остальные ключи сохранены");
+  String material, brand, colorHex, subtype;
+  int extruderTemp = 0, bedTemp = 0;
+  if (!readSpoolForTag(spoolID, material, brand, colorHex, extruderTemp, bedTemp, subtype)) {
+    setWriteResult(false);
+    return;
+  }
+  String payloadOut = buildOpenspoolJSON(spoolID, material, brand, colorHex, extruderTemp, bedTemp, subtype);
+  if (fmt == 2) {
+    Serial.println("FilaMan-метка: полная перезапись из Spoolman");
+    logger.println("FilaMan-метка (sm_id): перезаписана данными катушки ID:" + String(spoolID) + " из Spoolman (было: FilaMan sm_id)");
+  } else if (fmt == 1) {
+    Serial.println("Метка вендора/openspool: полная перезапись из Spoolman");
+    logger.println("Метка вендора/openspool: перезаписана данными катушки ID:" + String(spoolID) + " из Spoolman (было: вендорский/openspool JSON)");
   } else {
-    String material, brand, colorHex;
-    int extruderTemp = 0, bedTemp = 0;
-    if (!readSpoolForTag(spoolID, material, brand, colorHex, extruderTemp, bedTemp)) {
-      setWriteResult(false);
-      return;
-    }
-    payloadOut = buildOpenspoolJSON(spoolID, material, brand, colorHex, extruderTemp, bedTemp);
-    if (fmt == 2) {
-      Serial.println("FilaMan-метка: полная перезапись в openspool+spool_id");
-      logger.println("FilaMan-метка (sm_id): полная перезапись в openspool+spool_id");
-    } else {
-      Serial.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman");
-      logger.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman ID:" + String(spoolID));
-      if (payloadIn.length()) logger.println(sets::Logger::warn() + "Содержимое метки не распознано и будет перезаписано: " + payloadIn);
-    }
+    Serial.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman");
+    logger.println("Метка пустая/нераспознана: openspool JSON собран из Spoolman ID:" + String(spoolID));
+    if (payloadIn.length()) logger.println(sets::Logger::warn() + "Содержимое метки не распознано и будет перезаписано: " + payloadIn);
   }
 
   //3) Запись + подтверждение перечитыванием

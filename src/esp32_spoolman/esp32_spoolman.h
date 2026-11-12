@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.5"
+#define VER "1.3.6"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
@@ -208,5 +208,5 @@ bool writeNDEF(const String& payload);  //CC + TLV + запись по стра�
 bool linkTagUID(const String& uid, int spoolID, String& holderID);  //POST /spool/{id}/tag; 409 -> holderID
 bool unlinkTagUID(const String& uid, int spoolID);                  //DELETE /spool/{id}/tag/{uid} (D13/D9)
 bool eraseTag();                                                    //D9/D14: zero-fill + пустой NDEF + отвязка UID
-bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp);  //GET /spool/{id} для D6
+bool readSpoolForTag(int spoolID, String& material, String& brand, String& colorHex, int& extruderTemp, int& bedTemp, String& subtype);  //GET /spool/{id} для D43 (subtype из extra, D44)
 bool writeTick();  //таймаут ожидания метки + мигание (true — LED ведёт ожидание, updateLED не нужен)
