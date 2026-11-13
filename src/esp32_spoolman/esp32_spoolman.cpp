@@ -562,14 +562,14 @@ void setup() {
 
   pinMode(SW_WIFI, INPUT_PULLUP);
 
-  if (digitalRead(SW_WIFI) == 0 or !db[web::wifi_ssid].length()) {
+  if (digitalRead(SW_WIFI) == 0 || !db[web::wifi_ssid].length()) {
     wifiSettingMode = 1;
     WiFi.softAP("AP ESP_to_Spoolman");
     Serial.print("AP IP: ");
     Serial.println(WiFi.softAPIP());
   }
 
-  if (digitalRead(SW_WIFI) == 1 and db[web::wifi_ssid].length()) {
+  if (digitalRead(SW_WIFI) == 1 && db[web::wifi_ssid].length()) {
     wifiSettingMode = 0;
     WiFi.begin(db[web::wifi_ssid], db[web::wifi_pass]);
     Serial.print("Connect STA");
@@ -675,18 +675,29 @@ void loop() {
     if (!ledEffectTick()) updateLED();
   }
 
-  //Читаем Serial
-  if (Serial.available()) {
-    String i = Serial.readString();
-    String status = F("status");
-    if (i == status) {
-      statusServer();
-      curent_filament_name(curentID);
+  //Читаем Serial — построчно, без блокировки loop (P3, 1.3.10): readString() ждал таймаут
+  //(до 1 с) на каждой команде. Строка копится по байту за проход, исполняется по \n/\r;
+  //пустые строки игнорируются, буфер без терминатора сбрасывается на 64 байтах (мусор в порту
+  //не копится вечно)
+  static String serialLine = "";
+  String status = F("status");
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialLine.trim();
+      if (serialLine == status) {
+        statusServer();
+        curent_filament_name(curentID);
+      } else if (serialLine.length()) {
+        SetSpool(serialLine.toInt());
+      }
+      serialLine = "";
     } else {
-      int setID = i.toInt();
-      SetSpool(setID);
+      serialLine += c;
+      if (serialLine.length() > 64) serialLine = "";
     }
-  } else if (fl_status == true) {
+  }
+  if (fl_status == true) {
     fl_status = false;
     statusServer();
     curent_filament_name(curentID);
@@ -1309,10 +1320,13 @@ void readNFC() {
     return;
   }
 
-  //Дедуп по uint32-хешу UID: полный UID нужен только для HTTP
-  uint32_t uidHash = 0;
+  //Дедуп по uint32-хешу UID: полный UID нужен только для HTTP. FNV-1a по всем байтам (P3, 1.3.10):
+  //старый сдвиг оставлял только последние 4 байта — две 7/10-байтовые метки с совпадающим
+  //хвостом считались одной, и касание второй молча пропускалось
+  uint32_t uidHash = 2166136261u;
   for (byte i = 0; i < mfrc522.uid.size; i++) {
-    uidHash = (uidHash << 8) | mfrc522.uid.uidByte[i];
+    uidHash ^= mfrc522.uid.uidByte[i];
+    uidHash *= 16777619u;
   }
   lastSeenMs = millis();  //D34: метка видна — гэп отсчитывается от этого момента
   if (uidHash == lastUID) {

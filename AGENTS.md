@@ -9,6 +9,10 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
 <!-- CODEGRAPH_END -->
 
+> **Примечание для контрибьюторов:** пути `docs/`, `.scratch/`, `workflows/`, `.hermes/`
+> существуют только в рабочей копии владельца и в публичный репозиторий не входят —
+> ссылки на них ниже битые; это внутренние материалы агента.
+
 ## Agent skills
 
 ### Issue tracker

@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.9"
+#define VER "1.3.10"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan

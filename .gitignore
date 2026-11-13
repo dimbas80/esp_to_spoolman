@@ -7,11 +7,12 @@
 deploy.conf
 
 # Служебные и внутренние материалы — только локально, в публичный git не входят
-.scratch/
-summary.md
-workflows/
-docs/
-.hermes/
+# (якорь к корню: без него правило глотает и .github/workflows/ — CI не коммитится)
+/.scratch/
+/summary.md
+/workflows/
+/docs/
+/.hermes/
 
 # Python
 __pycache__/
