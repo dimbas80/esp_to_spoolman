@@ -28,6 +28,7 @@ __pycache__/
 # Arduino build artifacts
 
 # Тяжёлые артефакты отладки — не в git
+build/*.bin
 build/*.elf
 build/*.map
 build/cache/

@@ -184,6 +184,10 @@ web-интерфейса.
 # build/esp32_spoolman_v<VER>_ota.bin    образ приложения для OTA
 ```
 
+Готовые бинарники в git не входят — они прикладываются к GitHub Releases тега
+`v<VER>` (`gh release create v<VER> build/*.bin`); для OTA из веб-морды скачайте
+`esp32_spoolman_v<VER>_ota.bin` со страницы релиза.
+
 Версия берётся из `src/esp32_spoolman/esp32_spoolman.h` (`VER`), промежуточные
 артефакты arduino-cli лежат в `.build/` и в git не попадают. Эквивалент вручную:
 
