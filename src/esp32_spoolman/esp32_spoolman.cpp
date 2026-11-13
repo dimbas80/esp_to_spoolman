@@ -680,12 +680,14 @@ void loop() {
   //пустые строки игнорируются, буфер без терминатора сбрасывается на 64 байтах (мусор в порту
   //не копится вечно)
   static String serialLine = "";
-  String status = F("status");
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       serialLine.trim();
-      if (serialLine == status) {
+      //сравнение с литералом, не со String: конструктор String(F(...)) на каждом проходе loop
+      //давал malloc/free десятки тысяч раз в секунду — фрагментация кучи, перемежающиеся
+      //отказы HTTP/JSON (регрессия v1.3.10, P3-фикс v1.3.12)
+      if (serialLine == "status") {
         statusServer();
         curent_filament_name(curentID);
       } else if (serialLine.length()) {
