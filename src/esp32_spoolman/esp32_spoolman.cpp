@@ -802,6 +802,7 @@ void statusServer() {
     }
     bool statusServer = doc["result"]["spoolman_connected"];
     int newID = doc["result"]["spool_id"];  //null → 0
+    bool wasOk = prevMoonrakerOk;
     bool changed = (newID != curentID);     //reload шлём только при изменении отображаемого
     curentID = newID;
     db[web::id] = curentID;
@@ -821,7 +822,9 @@ void statusServer() {
       LED_MN = false;
       prevMoonrakerOk = false;
     }
-    if (changed) sett.reload();
+    //P3 (1.3.11): не только смена ID — флип связи Spoolman при том же ID тоже меняет
+    //отображаемое (LED_MN в веб-морде), без reload виджет оставался бы устаревшим
+    if (changed || wasOk != statusServer) sett.reload();
   } else {
     errorServer(String(httpResponseCode));
     http.end();
