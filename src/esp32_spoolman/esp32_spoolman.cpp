@@ -97,6 +97,15 @@ bool prevMoonrakerOk = false;
 //к дефолту (0x40 = 33 dB) и сбрасывает выставленный при старте 0x70 (48 dB). Гипотеза отказа
 //MIFARE_Read — деградация усиления приёма после самотеста; без лога gain это не проверить.
 //always=false — печатать только при смене значения (тик watchdog раз в 30 с не должен спамить).
+//D22: PCD_PerformSelfTest() завершается PCD_Init() — gain и режимы антенны сброшены в дефолт.
+//После КАЖДОГО самотеста (boot, watchdog, reset) восстанавливаем RxGain 0x07 (48 дБ) + антенну,
+//а не только логируем деградацию — иначе ридер с первого самотеста работает на 33 дБ.
+static void restoreReaderConfig() {
+  mfrc522.PCD_SetAntennaGain(0x07);
+  mfrc522.PCD_AntennaOff();
+  mfrc522.PCD_AntennaOn();
+}
+
 static void logReaderGain(const char* after, bool always) {
   static uint8_t lastGain = 0xFF;
   uint8_t gain = mfrc522.PCD_GetAntennaGain();
@@ -607,6 +616,7 @@ void setup() {
     LED_NFC = false;
   }
   logReaderGain("после самотеста (boot)", true);  //D22: фактический RxGain после PCD_Reset внутри самотеста
+  restoreReaderConfig();  //самотест сбросил gain — возвращаем 0x07 (48 дБ)
 }
 
 //D30: слоты Gate0..Gate3 из extra.mmu_gate_map (определение — в секции «MMU Gate» ниже)
@@ -640,6 +650,7 @@ void loop() {
       resetMFRC();
     } else {
       logReaderGain("после самотеста (watchdog)", false);  //D22: печатаем только при смене (самотест сбрасывает gain)
+      restoreReaderConfig();  //P1-фикс: gain после успешного самотеста не восстанавливался — ридер работал на 33 дБ
     }
   }
 
@@ -750,6 +761,7 @@ void resetMFRC() {
     LED_NFC = false;
   }
   logReaderGain("после самотеста (reset)", true);  //D22
+  restoreReaderConfig();  //gain ставился ДО самотеста и был сброшен — восстанавливаем
 }
 
 void statusServer() {
@@ -1511,7 +1523,7 @@ bool fetchSpoolList(bool noTagOnly) {
   HTTPClient http;
   String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?allow_archived=false";
   http.begin(url);
-  http.setTimeout(1500);
+  http.setTimeout(BULK_HTTP_TIMEOUT_MS);  //D41: bulk-список идёт дольше 2 с
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   int httpResponseCode = http.GET();
   if (httpResponseCode != 200) {
@@ -1667,7 +1679,7 @@ static void updateMmuGates() {
   HTTPClient http;
   String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?limit=1000";
   http.begin(url);
-  http.setTimeout(2000);
+  http.setTimeout(BULK_HTTP_TIMEOUT_MS);  //тот же bulk-список, что и в spoolsByCardUid (D41)
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   int code = http.GET();
   if (code != 200) {
@@ -2312,7 +2324,7 @@ static int spoolsByCardUid(const String& uid, int* outIds, int maxIds) {
   HTTPClient http;
   String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool?limit=1000";
   http.begin(url);
-  http.setTimeout(10000);  //D41: полный список идёт дольше 2 с — из-за 2 с bulk-GET списки обрывались
+  http.setTimeout(BULK_HTTP_TIMEOUT_MS);  //D41: полный список идёт дольше 2 с — из-за 2 с bulk-GET списки обрывались
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   uint32_t tGet = millis();
   int code = http.GET();

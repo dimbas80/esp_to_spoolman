@@ -9,7 +9,7 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.7"
+#define VER "1.3.8"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
@@ -168,6 +168,9 @@ extern TimerMs T_LED_WRITE;  //мигание «ждём метку» (250 мс,
 extern TimerMs T_GATES;      //D30: период опроса слотов MMU Gate (список в 1000 катушек — не каждый цикл)
 
 #define RETRY_DELAY 30000  //Пауза между повторными попытками HTTP (мс)
+//Единый таймаут bulk-GET списка катушек: полный список идёт дольше 2 с (D41), фильтр ArduinoJson
+//экономит только память парсера, а не время передачи — все три потребителя берут эту константу
+#define BULK_HTTP_TIMEOUT_MS 10000
 //D31: срок свечения результата NFC-операции (чтение/запись/стирание) и период мигания ошибки
 #define LED_EFFECT_MS 2000
 #define LED_BLINK_MS  250
