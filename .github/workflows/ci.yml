@@ -30,7 +30,8 @@ jobs:
             "GyverDB@1.4.4" \
             "TimerMs@1.2" \
             "Adafruit NeoPixel@1.15.5" \
-            "ArduinoJson@7.4.2"
+            "ArduinoJson@7.4.2" \
+            "BSON@2.3.5"  # зависимость Settings: без пина тянется 3.x с другим API
 
       - name: Compile (custom OTA partitions)
         run: |
