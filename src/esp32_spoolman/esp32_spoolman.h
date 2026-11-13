@@ -9,18 +9,21 @@
 #define ARDUINO_USB_MODE 1
 #endif
 
-#define VER "1.3.8"
+#define VER "1.3.9"
 #define SW_WIFI 6
 
 //Фиксированный идентификатор читателя для Spoolman POST /api/v1/tag/scan
 #define READER_ID "esp32-to-spoolman"
 
+//Отключаем double в ArduinoJson для экономии flash — define ДО include: библиотека потребляет
+//макрос в момент включения заголовков, поставленный после include он не действует (P2 ревью 1.3.9)
+#define ARDUINOJSON_USE_DOUBLE 0
+
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
-//Отключаем double в ArduinoJson и таблицы в Settings для экономии flash
-#define ARDUINOJSON_USE_DOUBLE 0
+//Отключаем таблицы в Settings для экономии flash (SettingsGyver включается ниже)
 #define SETT_NO_TABLE
 //Цвета для светодиода (hex RGB) — strip.setPixelColor(0, color) на пин PIN_DATA
 #define PIN_DATA 0
@@ -72,7 +75,6 @@ class FileLogger : public sets::Logger {
 };
 
 extern FileLogger logger;
-extern WiFiServer server;
 
 DB_KEYS(
   web,
@@ -161,7 +163,8 @@ extern bool prevSpoolmanOk;   //предыдущее состояние Spoolman
 extern bool prevMoonrakerOk;  //предыдущее состояние Moonraker (для лога изменений)
 
 #include <TimerMs.h>
-extern TimerMs T_LED_WIFI;
+extern TimerMs T_LED_AP;     //мигание синим в AP-режиме (500 мс; экс-T_LED_WIFI — имя врал, P2 ревью 1.3.9)
+extern TimerMs T_SERVERS;    //опрос Moonraker/Spoolman (3 с; было 500 мс блокирующего HTTP — P2 ревью 1.3.9)
 extern TimerMs ResetLED;
 extern TimerMs WatchdogNFC;
 extern TimerMs T_LED_WRITE;  //мигание «ждём метку» (250 мс, D16)

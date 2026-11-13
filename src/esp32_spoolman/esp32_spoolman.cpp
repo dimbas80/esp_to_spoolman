@@ -23,7 +23,6 @@ SettingsGyver sett("ESP to Spoolman", &db);
 
 //D32: логгер пишет и в RAM-буфер (виджет b.Log), и в /log.txt на LittleFS — по строке.
 FileLogger logger(1024);
-WiFiServer server(80);
 
 size_t FileLogger::write(uint8_t v) {
   sets::Logger::write(v);  //RAM-буфер логгера: поведение виджета лога не меняется
@@ -117,7 +116,8 @@ static void logReaderGain(const char* after, bool always) {
   logger.println(gain == 0x70 ? msg : sets::Logger::warn() + msg);
 }
 
-TimerMs T_LED_WIFI(500, 1, 0);
+TimerMs T_LED_AP(500, 1, 0);    //экс-T_LED_WIFI: только мигание синим в AP-режиме (имя врало — P2 ревью 1.3.9)
+TimerMs T_SERVERS(3000, 1, 0);  //опрос Moonraker/Spoolman: было 500 мс — 4 блокирующих HTTP-запроса/с
 TimerMs ResetLED(1000, 1, 0);
 TimerMs WatchdogNFC(30000, 1, 0);
 TimerMs T_LED_WRITE(250, 1, 0);
@@ -445,7 +445,7 @@ void update(sets::Updater& upd) {
 void updateLED() {
   if (wifiSettingMode == 1) {
     //AP режим — мигаем синим
-    if (T_LED_WIFI.ready()) set_led_color(BLUE);
+    if (T_LED_AP.ready()) set_led_color(BLUE);
     else set_led_color(0);
   } else if (WiFi.status() != WL_CONNECTED) {
     set_led_color(RED);
@@ -485,7 +485,8 @@ void setup() {
   strip.setBrightness(50);
   strip.clear();
   strip.show();
-  T_LED_WIFI.setPeriodMode();
+  T_LED_AP.setPeriodMode();
+  T_SERVERS.setPeriodMode();  //P2 (1.3.9): опрос серверов вынесен из 500-мс таймера LED-мигания
   ResetLED.setPeriodMode();
   WatchdogNFC.setPeriodMode();
   T_LED_WRITE.setPeriodMode();
@@ -581,7 +582,6 @@ void setup() {
     Serial.println();
     Serial.print(F("IP: "));
     Serial.println(WiFi.localIP());
-    server.begin();
     WiFi.softAPdisconnect(true);
   }
 
@@ -626,16 +626,17 @@ static bool ledEffectTick();
 
 void loop() {
   sett.tick();
-  T_LED_WIFI.tick();
+  T_LED_AP.tick();
+  T_SERVERS.tick();
   ResetLED.tick();
   WatchdogNFC.tick();
   T_GATES.tick();
 
-  if (T_LED_WIFI.ready() && WiFi.status() == WL_CONNECTED) {
+  if (T_SERVERS.ready() && WiFi.status() == WL_CONNECTED) {
     statusServer();
     curent_filament_name(curentID);
     //D30: слоты MMU Gate — в том же цикле проверки серверов; свой 10-секундный период, потому
-    //что это GET списка катушек (limit=1000), а цикл индикаторов — 500 мс (D30, см. T_GATES)
+    //что это GET списка катушек (limit=1000), а цикл индикаторов — 3 с (см. T_SERVERS)
     if (T_GATES.ready()) updateMmuGates();
   }
 
@@ -776,7 +777,9 @@ void statusServer() {
   http.addHeader("Content-Type", "application/json");
   int httpResponseCode = http.GET();
 
-  if (httpResponseCode > 0) {
+  //P2 (1.3.9): успех — только 200; любой другой код (включая 404/500) раньше красил LED_MN
+  //в «сервер доступен» и попадал в парсинг
+  if (httpResponseCode == 200) {
     String response = http.getString();
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, response);
@@ -787,7 +790,9 @@ void statusServer() {
       return;
     }
     bool statusServer = doc["result"]["spoolman_connected"];
-    curentID = doc["result"]["spool_id"];
+    int newID = doc["result"]["spool_id"];  //null → 0
+    bool changed = (newID != curentID);     //reload шлём только при изменении отображаемого
+    curentID = newID;
     db[web::id] = curentID;
 
     if (statusServer) {
@@ -805,12 +810,14 @@ void statusServer() {
       LED_MN = false;
       prevMoonrakerOk = false;
     }
-    sett.reload();
+    if (changed) sett.reload();
   } else {
     errorServer(String(httpResponseCode));
     http.end();
     lastMoonrakerFail = millis();
+    if (prevMoonrakerOk) sett.reload();  //LED_MN гаснет — страница должна перестроиться
     LED_MN = false;
+    prevMoonrakerOk = false;
   }
 }
 
@@ -824,6 +831,16 @@ void curent_filament_name(int ID) {
     return;
   }
 
+  //P2 (1.3.9): ID=0 — активной катушки нет; /api/v1/spool/0 отвечает 404, который раньше
+  //трактовался как «сервер доступен» и опрашивался каждый тик. Ноль не опрашиваем.
+  if (ID <= 0) {
+    if (String(db[web::filament]) != "0") {
+      db[web::filament] = "0";
+      sett.reload();
+    }
+    return;
+  }
+
   HTTPClient http;
   String url = "http://" + String(db[web::serverSpoolman]) + "/api/v1/spool/" + String(ID);
   http.begin(url);
@@ -831,7 +848,9 @@ void curent_filament_name(int ID) {
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
   int httpResponseCode = http.GET();
-  if (httpResponseCode > 0) {
+  //P2 (1.3.9): успех — только 200; 404/500 раньше красили LED_SP в зелёный («Сервер Spoolman
+  //доступен») и скармливали парсеру тело ошибки
+  if (httpResponseCode == 200) {
     String payload = http.getString();
     http.end();
 
@@ -847,26 +866,31 @@ void curent_filament_name(int ID) {
     }
 
     const char* name = doc["filament"]["name"] | "0";
-    db[web::filament] = name;
 
     //Лог имени катушки только при смене
     static String lastName = "";
-    if (lastName != name) {
+    bool nameChanged = (lastName != name);
+    db[web::filament] = name;
+    if (nameChanged) {
       lastName = name;
       Serial.println("ID: " + String(ID) + ", Name: " + String(name));
       logger.println(sets::Logger::warn() + "ID: " + String(ID) + ", Name: " + String(name));
     }
 
+    bool wasOk = prevSpoolmanOk;
     if (!prevSpoolmanOk) {
       Serial.println("Сервер Spoolman доступен");
       logger.println("Сервер Spoolman доступен");
     }
     LED_SP = true;
     prevSpoolmanOk = true;
+    //reload только при изменении отображаемого (имя или появление связи): P2 (1.3.9)
+    if (nameChanged || !wasOk) sett.reload();
   } else {
     http.end();
     errorServer(String(httpResponseCode));
     db[web::filament] = "0";
+    bool wasOk = prevSpoolmanOk;
     if (prevSpoolmanOk) {
       Serial.println("Сервер Spoolman не доступен");
       logger.println(sets::Logger::error() + "Сервер Spoolman не доступен");
@@ -874,8 +898,8 @@ void curent_filament_name(int ID) {
     LED_SP = false;
     prevSpoolmanOk = false;
     lastSpoolmanFail = millis();
+    if (wasOk) sett.reload();  //LED_SP и имя погасли — страница должна перестроиться
   }
-  sett.reload();
 }
 
 bool getIDSpool(int ID) {
